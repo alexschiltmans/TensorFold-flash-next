@@ -1063,15 +1063,27 @@ class LaneEngine(FamilyRounds):
         return total
 
     @staticmethod
-    def copy_single_cache(cache: list[Any]) -> list[Any]:
-        """Deep copy a batch-1 cache list so a retained checkpoint survives reuse."""
+    def copy_single_cache(cache: list[Any], reserve: int = 0) -> list[Any]:
+        """Deep copy a batch-1 cache list so a retained checkpoint survives reuse.
+
+        Layer caches with ``copy_compact`` (TF_CACHE_COMPACT=1) copy only their positions, with room for
+        ``reserve`` positions when a request resumes from the copy, and are evaluated here: a lazy copy would keep
+        the source's buffer referenced, and MLX copies a referenced buffer whole at its next write."""
 
         import copy as _copy
 
         import mlx.core as mx
 
+        compact = os.environ.get("TF_CACHE_COMPACT", "").strip() not in ("", "0")
         out: list[Any] = []
+        fresh: list[Any] = []
         for item in cache:
+            copier = getattr(item, "copy_compact", None) if compact else None
+            if copier is not None:
+                clone = copier(reserve)
+                fresh.extend(a for a in (clone.keys, clone.values, clone.index_keys) if a is not None)
+                out.append(clone)
+                continue
             clone = _copy.copy(item)
             for key, value in vars(item).items():
                 if isinstance(value, mx.array):
@@ -1083,6 +1095,8 @@ class LaneEngine(FamilyRounds):
                         [mx.array(v) if isinstance(v, mx.array) else v for v in value],
                     )
             out.append(clone)
+        if fresh:
+            mx.eval(*fresh)
         return out
 
     def _merge(self, caches: list[list[Any]]) -> list[Any]:

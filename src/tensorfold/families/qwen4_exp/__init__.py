@@ -38,8 +38,25 @@ def has_mtp(model_dir: Path) -> bool:
 def check(model_dir: Path) -> None:
     from tensorfold.families import quantization, read_config
 
-    bits, group = quantization(read_config(model_dir))
-    if (bits, group) != (4, 32):
+    config = read_config(model_dir)
+    bits, group = quantization(config)
+    quant = config.get("quantization") or config.get("quantization_config") or {}
+    if (config.get("ngram_source") or config.get("experts_source")
+            or any(isinstance(v, dict) for v in quant.values())):
+        # mixed-precision checkpoints (per-module bits, or the n-gram table read from a file) run the reference
+        # forward: model.load() leaves the fused kernels off for them
+        print("[tensorfold] mixed-precision Flash Next checkpoint: the fused kernels are off, reference forward",
+              flush=True)
+        # MLX_ENV's command buffers (200 ops, no size bound) are for the fused kernels. On the reference forward a
+        # command buffer then holds the inputs of up to 200 ops until it completes: a 2,048-row prompt chunk
+        # through 4 layers held 6.9 GiB of buffers against 1.3 GiB with MLX's own settings, and one-token decode
+        # through 12 layers took 13.9 ms against 11.2 ms; outputs bit-identical (M4 Pro).
+        # So the reference forward keeps MLX's settings; TF_FLASH_REF_MLX_ENV=tf applies MLX_ENV to it as well.
+        import os
+
+        if os.environ.get("TF_FLASH_REF_MLX_ENV", "mlx") != "tf":
+            MLX_ENV.clear()
+    elif (bits, group) != (4, 32):
         raise ValueError(f"TensorFold's Flash Next kernels read 4-bit weights in groups of 32; this checkpoint has "
                          f"{bits}-bit weights in groups of {group}. Use {MODELS[0]}.")
     # The CLI may have downloaded only config.json for its preflight check. Do not report a missing head until
@@ -53,7 +70,11 @@ def check(model_dir: Path) -> None:
 def load(model_dir: Path, *, mtp_drafts: int | None = None, **_: Any) -> tuple[Any, Any]:
     from tensorfold.families.qwen4_exp.runtime import load as load_runtime
 
-    return load_runtime(Path(model_dir), drafts=mtp_drafts if has_mtp(Path(model_dir)) else 0)
+    import os
+
+    # TF_FLASH_MTP_GGUF: a head from a llama.cpp GGUF for a checkpoint without one (runtime.load)
+    with_head = has_mtp(Path(model_dir)) or bool(os.environ.get("TF_FLASH_MTP_GGUF", "").strip())
+    return load_runtime(Path(model_dir), drafts=mtp_drafts if with_head else 0)
 
 
 def engine_settings(model: Any) -> dict[str, Any]:

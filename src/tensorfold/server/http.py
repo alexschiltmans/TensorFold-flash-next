@@ -11,11 +11,26 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
+import socket
+import threading
 import time
 import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler
 from typing import Any
+
+# The connection of the request this HTTP thread serves: ``CLIENT.alive()`` is False once the client has hung up
+# (a killed agent), so the app can stop generating for nobody.
+CLIENT = threading.local()
+
+
+def _connection_alive(sock: socket.socket) -> bool:
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+        return not readable or sock.recv(1, socket.MSG_PEEK) != b""
+    except (OSError, ValueError):
+        return False
 
 # TENSORFOLD_REQUEST_LOG=path appends every request body (one JSON a line), for exact replays of real traffic
 _REQUEST_LOG = os.environ.get("TENSORFOLD_REQUEST_LOG", "")
@@ -279,6 +294,53 @@ def _strip_json_fence(text: str) -> str:
     return match.group(1).strip()
 
 
+def _schema_types(prop: Any) -> list[str]:
+    """The JSON-schema type names of one tool parameter (``type`` may be a string or a list; anyOf/oneOf too)."""
+
+    if not isinstance(prop, dict):
+        return []
+    kind = prop.get("type")
+    names = [kind] if isinstance(kind, str) else [k for k in kind if isinstance(k, str)] if isinstance(kind, list) else []
+    for key in ("anyOf", "oneOf"):
+        for sub in prop.get(key) or []:
+            names += _schema_types(sub)
+    return names
+
+
+def _coerce_value(value: Any, prop: Any) -> Any:
+    """A string the model wrote for a non-string parameter, read as that type (as llama.cpp's and vLLM's Qwen tool
+    parsers do): the XML <parameter=...> form carries every value as text. Strings stay byte for byte."""
+
+    types = _schema_types(prop)
+    if not isinstance(value, str) or not types or "string" in types:
+        return value
+    text = value.strip()
+    for kind in types:
+        try:
+            if kind == "integer" and re.fullmatch(r"[+-]?\d+", text):
+                return int(text)
+            if kind == "number" and re.fullmatch(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", text):
+                number = float(text)
+                return int(number) if number.is_integer() and re.fullmatch(r"[+-]?\d+", text) else number
+            if kind == "boolean" and text.lower() in ("true", "false"):
+                return text.lower() == "true"
+            if kind == "null" and text.lower() in ("null", "none"):
+                return None
+            if kind in ("object", "array"):
+                parsed = json.loads(text)
+                if isinstance(parsed, dict if kind == "object" else list):
+                    return parsed
+        except (ValueError, json.JSONDecodeError):
+            continue
+    return value
+
+
+def _coerce_arguments(arguments: dict[str, Any], spec: Any) -> dict[str, Any]:
+    function = spec.get("function", spec) if isinstance(spec, dict) else {}
+    props = ((function or {}).get("parameters") or {}).get("properties") or {}
+    return {key: _coerce_value(value, props.get(key)) for key, value in arguments.items()}
+
+
 def _openai_tool_call(raw_name: str, arguments: dict[str, Any], known: dict[str, str]) -> dict[str, Any]:
     name = known.get(raw_name.lower())
     if name is None:
@@ -327,6 +389,7 @@ def parse_tool_calls_from_content(
     if not tools:
         return text, None
     known = {tool_spec_name(tool).lower(): tool_spec_name(tool) for tool in tools}
+    specs = {tool_spec_name(tool).lower(): tool for tool in tools}
     envelopes: list[tuple[int, int, str]] = []
     for match in _TOOL_CALL_BLOCK_RE.finditer(text):
         envelopes.append((match.start(), match.end(), match.group(1).strip()))
@@ -334,6 +397,11 @@ def parse_tool_calls_from_content(
         envelopes.append((match.start(), match.end(), match.group(2).strip()))
     if not envelopes:
         bare_calls = _parse_bare_json_tool_calls(text, known)
+        if bare_calls is not None:
+            for call in bare_calls:
+                fn = call["function"]
+                fn["arguments"] = json.dumps(_coerce_arguments(json.loads(fn["arguments"]), specs.get(fn["name"].lower())),
+                                             ensure_ascii=False, separators=(",", ":"))
         if bare_calls is not None:
             return "", bare_calls
         return text, None
@@ -353,7 +421,7 @@ def parse_tool_calls_from_content(
             # raising here ended the stream, and the agent client retried the same turn in a loop.
             residue_parts.append(text[start:end])
             continue
-        calls.append(_openai_tool_call(raw_name, arguments, known))
+        calls.append(_openai_tool_call(raw_name, _coerce_arguments(arguments, specs.get(raw_name.lower())), known))
         if index + 1 < len(envelopes) and envelopes[index + 1][0] < end:
             raise ValueError("overlapping tool_call blocks")
     residue_parts.append(text[cursor:])
@@ -496,6 +564,7 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
             return [{"role": "user", "content": self._legacy_prompt_to_text(body.get("prompt", ""))}]
 
         def do_POST(self) -> None:
+            CLIENT.alive = lambda sock=self.connection: _connection_alive(sock)
             route = self._route()
             is_chat_completion = route.endswith("/chat/completions")
             is_text_completion = route.endswith("/completions") and not is_chat_completion

@@ -59,6 +59,19 @@ from typing import Any, Sequence
 _PROFILE = os.environ.get("TF_FAMILY_PROFILE", "") == "1"
 
 
+def reply_room(prompt_len: int, max_new_tokens: int) -> int:
+    """Positions a request's caches reserve with TF_CACHE_COMPACT=1: the prompt plus up to
+    TF_CACHE_RESERVE_REPLY reply tokens (default 4,096; about 140 MB on Flash Next's 12 attention layers). 0 when
+    the setting is off."""
+
+    import os
+
+    if os.environ.get("TF_CACHE_COMPACT", "").strip() in ("", "0"):
+        return 0
+    reply = int(os.environ.get("TF_CACHE_RESERVE_REPLY", "").strip() or 4096)
+    return int(prompt_len) + max(0, min(int(max_new_tokens), reply))
+
+
 def drop_spares(cache: list[Any]) -> list[Any]:
     """``alternating_kv.drop_spares`` (imported when used: this module loads without MLX)."""
 
@@ -164,6 +177,12 @@ class FamilyRounds:
                 work = adopt(work)
         if not 0 <= start < len(stream.prompt_ids):
             raise ValueError(f"{stream.stream_id}: cached_tokens must leave a suffix to prefill")
+        # TF_CACHE_COMPACT: room for the prompt and the first reply tokens in one allocation (a no-op otherwise)
+        room = reply_room(len(stream.prompt_ids), int(stream.max_new_tokens))
+        for item in work:
+            reserve = getattr(item, "reserve", None)
+            if room and reserve is not None:
+                reserve(room)
         stream.history_checkpoints = []
         for boundary in sorted({int(b) for b in checkpoints_at}):
             if not start < boundary < len(stream.prompt_ids):
@@ -386,6 +405,13 @@ class FamilyRounds:
             self.accepted += keep - 1
             stream.drafted += len(proposed)
             stream.accepted += keep - 1
+            # per proposer and head depth (logging only): {"copy": [drafted, accepted], "head": [...], "h<d>": rounds}
+            kinds = stream.__dict__.setdefault("draft_kinds", {})
+            tally = kinds.setdefault(kind, [0, 0])
+            tally[0] += len(proposed)
+            tally[1] += keep - 1
+            if kind == "head":
+                kinds[f"h{len(proposed)}"] = kinds.get(f"h{len(proposed)}", 0) + 1
             if kind == "copy":
                 observe = getattr(stream.proposer, "observe", None)
                 if callable(observe):

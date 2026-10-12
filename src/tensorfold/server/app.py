@@ -16,8 +16,10 @@ Sampling is exact: a token is a fixed function of its position's logits, the req
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 import itertools
+import os
 from pathlib import Path
 import queue
 import threading
@@ -27,6 +29,7 @@ import uuid
 
 from tensorfold.engine.lane_engine import LaneEngine, LaneStream, SuffixLookupProposer
 from tensorfold.server.http import (
+    CLIENT,
     RequestError,
     _normalize_tool_call_arguments,
     parse_harmony_output,
@@ -137,6 +140,116 @@ def longest_common_prefix(a: list[int], b: list[int]) -> int:
     return n
 
 
+def common_prefix_len(a: Any, b: Any) -> int:
+    """``longest_common_prefix`` for long token lists (numpy; a 131k-token prompt in a few ms)."""
+
+    import numpy as np
+
+    n = min(len(a), len(b))
+    if n == 0:
+        return 0
+    x = np.asarray(a[:n], dtype=np.int64)
+    y = np.asarray(b[:n], dtype=np.int64)
+    differ = np.flatnonzero(x != y)
+    return int(differ[0]) if differ.size else n
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    return default if not value else value not in ("0", "false", "no", "off")
+
+
+# Prefix checkpoints for long prompts (TF_PREFIX_ANCHORS=1). A stored prefix is worth its full length or nothing
+# (GDN state cannot be truncated), and checkpoints were only taken at the rendered history boundary, the system
+# block and the reply's end. A prompt that shares a long prefix with an earlier one but differs before those points
+# (the same document with another question; a client that re-renders or edits the tail of a long conversation)
+# therefore re-prefilled from zero: 64K prompts at about 310 s each, every time (Flash-Next, M4 Pro).
+# llama.cpp keeps one KV and truncates it to the common prefix: it recomputes about 512 tokens past a checkpoint
+# it takes before a prompt's last batch. Two checkpoints do the same here:
+#   - a tail checkpoint TAIL_BACKOFF tokens before the end of a prompt that prefills at least TAIL_MIN_PREFILL
+#     tokens, so a next prompt that differs only in its last TAIL_BACKOFF tokens reuses the rest;
+#   - a divergence anchor ANCHOR_BACKOFF tokens before the end of the longest prefix a prompt shares with a recent
+#     prompt or a stored entry, when that reuses ANCHOR_MIN_GAIN tokens more than its own hit: later prompts that
+#     share the prefix then reuse all of it. The backoff keeps the anchor a prefix of prompts that diverge a few
+#     tokens earlier ("Write a Python function" / "Write a Python context manager").
+# With TF_PREFIX_SHARE the nested entries share one KV, so each extra checkpoint costs its recurrent state only.
+ANCHOR_BACKOFF = 16
+ANCHOR_MIN_GAIN = 256
+# anchors evicted after the other conversation entries; older ones become ordinary entries (as pinned_slots)
+ANCHOR_SLOTS = 2
+TAIL_BACKOFF = 512
+TAIL_MIN_PREFILL = 4096
+# earlier prompts an anchor is looked for in (besides the stored entries' own tokens)
+ANCHOR_RECENT = 4
+
+
+def share_prefix_kv(older: list[Any], newer: list[Any]) -> int:
+    """Point ``older``'s append-only KV arrays at ``newer``'s buffers where they hold the same values, so a stored
+    prefix of a stored conversation costs its recurrent state only (TF_PREFIX_SHARE=1). Returns the bytes of the
+    arrays now shared.
+
+    Layer caches with ``offset`` and position-indexed ``keys``/``values`` (axis 2) and ``index_keys`` (axis 1)
+    only read and write from ``offset`` on through these arrays, so ``older`` can hold ``newer``'s longer array:
+    positions below ``older.offset`` are compared bit for bit before the swap (a prefix computed in another
+    chunking may differ). MLX never writes a buffer another array still references, so a cache resumed from either
+    entry copies on its first write, as it does from an unshared entry."""
+
+    import mlx.core as mx
+
+    if len(older) != len(newer):
+        return 0
+    found: list[tuple[Any, str, Any, int]] = []
+    checks: list[Any] = []
+    for a, b in zip(older, newer):
+        if type(a) is not type(b):
+            continue
+        n = getattr(a, "offset", None)
+        m = getattr(b, "offset", None)
+        if not isinstance(n, int) or not isinstance(m, int) or not 0 < n <= m:
+            continue
+        for name, axis in (("keys", 2), ("values", 2), ("index_keys", 1)):
+            x, y = getattr(a, name, None), getattr(b, name, None)
+            if not isinstance(x, mx.array) or not isinstance(y, mx.array) or x is y:
+                continue
+            if x.ndim != y.ndim or x.ndim <= axis or x.dtype != y.dtype or min(x.shape[axis], y.shape[axis]) < n:
+                continue
+            if any(x.shape[i] != y.shape[i] for i in range(x.ndim) if i != axis):
+                continue
+            cut = (slice(None),) * axis + (slice(0, n),)
+            checks.append(mx.array_equal(x[cut], y[cut]))
+            found.append((a, name, y, int(x.nbytes)))
+    if not found:
+        return 0
+    if os.environ.get("TF_CACHE_COMPACT", "").strip() not in ("", "0"):
+        # one comparison at a time: each builds a boolean array half its KV's size, and evaluating them all at
+        # once held every one of them (several GB at 32K with a few entries; 2-4 GB wired spikes)
+        same = [bool(check.item()) for check in checks]
+    else:
+        same = mx.stack(checks).tolist()
+    shared = 0
+    for (a, name, y, nbytes), equal in zip(found, same):
+        if equal:
+            setattr(a, name, y)
+            shared += nbytes
+    return shared
+
+
+def unique_cache_bytes(caches: Any) -> int:
+    """Bytes of the distinct MLX arrays the given cache lists hold (arrays shared between entries count once)."""
+
+    import mlx.core as mx
+
+    seen: dict[int, int] = {}
+    for cache in caches:
+        for item in cache:
+            for value in vars(item).values():
+                values = value if isinstance(value, (list, tuple)) else (value,)
+                for v in values:
+                    if isinstance(v, mx.array):
+                        seen[id(v)] = int(v.nbytes)
+    return sum(seen.values())
+
+
 def choose_checkpoints(
     history_len: int, cached: int, last_prompt: list[int] | None, prompt: list[int]
 ) -> list[int]:
@@ -167,7 +280,8 @@ def is_title_request(messages: list[dict[str, Any]], tools: Any) -> bool:
 
     Agent clients send one ("Write a ~5 word title ...") with a new session's first turn, 10 ms or so
     before the turn itself. It runs in the background: it gives the turn a head start, goes after
-    any other waiting request, and is preempted when one arrives, so the turn never waits for it.
+    any other waiting request, and is preempted when one arrives before its first token (after that it
+    finishes: a rerun would not reproduce the tokens already sent).
     """
 
     if tools or not messages or messages[0].get("role") != "system":
@@ -212,6 +326,19 @@ def _mlx_version() -> str:
     return str(mx.__version__)
 
 
+def _draft_kinds(stream: Any) -> str:
+    """The done line's per-proposer draft counts (lane family): copy/head drafted and accepted, head rounds by depth."""
+
+    kinds = getattr(stream, "__dict__", {}).get("draft_kinds") if stream is not None else None
+    if not kinds:
+        return ""
+    parts = [f"{k}={v[1]}/{v[0]}" for k, v in kinds.items() if isinstance(v, list)]
+    depths = sorted((k, v) for k, v in kinds.items() if k.startswith("h") and isinstance(v, int))
+    if depths:
+        parts.append("depths=" + ",".join(f"{k[1:]}:{v}" for k, v in depths))
+    return "kinds " + " ".join(parts) + " "
+
+
 def _token_sha(tokens: list[int]) -> str:
     """A short fingerprint of a reply's tokens: two runs match byte for byte iff these match."""
 
@@ -248,6 +375,8 @@ class CheckpointEntry:
     nbytes: int = 0
     # A system block (loaded from disk, or saved to it): outside the slot count.
     pinned: bool = False
+    # A divergence anchor (TF_PREFIX_ANCHORS): evicted after the other conversation entries.
+    anchor: bool = False
 
 
 def save_conversations(store: "CheckpointStore", directory: Path, model_id: str, *, keep: int = 2,
@@ -314,6 +443,7 @@ class CheckpointStore:
         budget_bytes: int | None = None,
         sizer: Callable[[list[Any]], int] | None = None,
         pinned_slots: int = 3,
+        share_prefixes: bool = False,
     ) -> None:
         if slots < 1:
             raise ValueError("slots must be positive")
@@ -324,18 +454,27 @@ class CheckpointStore:
         self.copier = copier
         self.budget_bytes = None if budget_bytes is None else int(budget_bytes)
         self.sizer = sizer
+        # TF_PREFIX_SHARE: a stored prefix of another entry holds that entry's KV arrays (``share_prefix_kv``), and
+        # the budget counts distinct arrays
+        self.share_prefixes = bool(share_prefixes)
         self._entries: list[CheckpointEntry] = []
         self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
         self.evictions = 0
 
+    def _bytes(self, entries: list[CheckpointEntry]) -> int:
+        if self.share_prefixes:
+            return unique_cache_bytes(entry.cache for entry in entries)
+        return sum(entry.nbytes for entry in entries)
+
     @property
     def nbytes(self) -> int:
-        return sum(entry.nbytes for entry in self._entries)
+        return self._bytes(self._entries)
 
-    def match(self, prompt: list[int]) -> tuple[int, list[Any], list[int]] | None:
-        """Longest strict-prefix hit as (length, cache copy, previous prompt)."""
+    def match(self, prompt: list[int], reserve: int = 0) -> tuple[int, list[Any], list[int]] | None:
+        """Longest strict-prefix hit as (length, cache copy, previous prompt); with ``reserve`` the copy has room
+        for that many positions (TF_CACHE_COMPACT: one allocation instead of a copy and a regrow)."""
 
         with self._lock:
             best: CheckpointEntry | None = None
@@ -352,7 +491,8 @@ class CheckpointStore:
             self._entries.insert(0, best)
             previous = list(best.last_prompt)
             best.last_prompt = list(prompt)
-            return len(best.tokens), self.copier(best.cache), previous
+            copy = self.copier(best.cache, reserve) if reserve else self.copier(best.cache)
+            return len(best.tokens), copy, previous
 
     def longest(self, prompt: list[int]) -> int:
         """Length of the longest strict-prefix entry (0 if none); not counted as a hit or miss."""
@@ -363,7 +503,7 @@ class CheckpointStore:
                        default=0)
 
     def insert(self, tokens: list[int], cache: list[Any], *, last_prompt: list[int],
-               pinned: bool = False) -> None:
+               pinned: bool = False, anchor: bool = False) -> None:
         if not tokens:
             return
         nbytes = int(self.sizer(cache)) if self.sizer is not None else 0
@@ -371,19 +511,33 @@ class CheckpointStore:
             replaced = [entry for entry in self._entries if entry.tokens == list(tokens)]
             kept = [entry for entry in self._entries if entry.tokens != list(tokens)]
             pinned = pinned or any(entry.pinned for entry in replaced)
-            entry = CheckpointEntry(list(tokens), cache, list(last_prompt), nbytes, pinned)
+            anchor = anchor or any(entry.anchor for entry in replaced)
+            entry = CheckpointEntry(list(tokens), cache, list(last_prompt), nbytes, pinned, anchor)
+            if self.share_prefixes:
+                # stored prefixes of the new entry (at least half its length: a short system block must not keep a
+                # long conversation's arrays alive) take its KV arrays; stored entries it is a prefix of lend theirs
+                for other in kept:
+                    a, b = (other, entry) if len(other.tokens) < len(entry.tokens) else (entry, other)
+                    if 2 * len(a.tokens) >= len(b.tokens) and b.tokens[: len(a.tokens)] == a.tokens:
+                        try:
+                            share_prefix_kv(a.cache, b.cache)
+                        except Exception as exc:  # noqa: BLE001 - sharing only saves memory
+                            print(f"[tensorfold] prefix share failed: {type(exc).__name__}: {exc}", flush=True)
             entries = [entry, *kept]
             for extra in [e for e in entries if e.pinned][self.pinned_slots:]:
                 extra.pinned = False
+            for extra in [e for e in entries if e.anchor][ANCHOR_SLOTS:]:
+                extra.anchor = False
             # the new entry itself is never evicted: least recently used first, conversations
-            # before system blocks
+            # before divergence anchors before system blocks
             while True:
                 over_slots = sum(1 for e in entries if not e.pinned) > self.slots
                 over_budget = (self.budget_bytes is not None and len(entries) > 1
-                               and sum(e.nbytes for e in entries) > self.budget_bytes)
+                               and self._bytes(entries) > self.budget_bytes)
                 if not (over_slots or over_budget):
                     break
-                unpinned = [i for i in range(1, len(entries)) if not entries[i].pinned]
+                unpinned = ([i for i in range(1, len(entries)) if not entries[i].pinned and not entries[i].anchor]
+                            or [i for i in range(1, len(entries)) if not entries[i].pinned])
                 if unpinned:
                     entries.pop(unpinned[-1])
                 elif over_budget:
@@ -420,7 +574,7 @@ class ChatJob:
     think_close: tuple[int, ...] = ()
     think_end: int = -1
     # A client's side request (a session title): admitted after every other waiting job, and stopped
-    # ("preempted") when one arrives; its caller runs it again from the start.
+    # ("preempted") when one arrives before it has produced a token; its caller runs it again from the start.
     background: bool = False
     preempted: bool = False
     submitted_at: float = field(default_factory=time.perf_counter)
@@ -430,6 +584,8 @@ class ChatJob:
     cached_tokens: int = 0
     stream: LaneStream | None = None
     error: BaseException | None = None
+    # the client hung up: not started if still waiting, stopped at the next round if running
+    cancelled: bool = False
     chunks: "queue.Queue[list[int] | None]" = field(default_factory=queue.Queue)
     done: threading.Event = field(default_factory=threading.Event)
 
@@ -467,9 +623,13 @@ class Scheduler:
         snapshot_dir: Any = None,
         session_dir: Any = None,
         model_id: str = "",
+        anchors: bool = False,
     ) -> None:
         if lanes < 1:
             raise ValueError("lanes must be positive")
+        # TF_PREFIX_ANCHORS: checkpoints where a prompt diverges from an earlier one (ANCHOR_BACKOFF)
+        self.anchors = bool(anchors)
+        self._recent_prompts: deque[list[int]] = deque(maxlen=ANCHOR_RECENT)
         self.snapshot_dir = snapshot_dir
         self.session_dir = session_dir
         self.model_id = model_id
@@ -616,14 +776,17 @@ class Scheduler:
                     self._retire(job)
 
     def _preempt_background(self) -> None:
-        """A waiting request takes the engine from a running background job at the next round. Stopped here, the
-        background job runs again from the start once the engine is free: the same prompt and sampling give the
-        same tokens, and its caller drops the ones it already has."""
+        """A waiting request takes the engine from a running background job at the next round, as long as that job
+        has not produced a token yet. Stopped here, it runs again from the start once the engine is free. A job that
+        has produced tokens runs to its end: a rerun does not reproduce them bit for bit (its logits differ in the
+        low bits, batched or alone, cached or fresh prefill), and its caller would splice two different replies.
+        Tokens are committed on this thread (engine.step), so no token reaches the caller after this check."""
 
         if not self._queue.foreground_waiting() and not (self._held is not None and not self._held.background):
             return
         for job in self._jobs.values():
-            if job.background and not job.preempted and job.stream is not None and not job.stream.finished:
+            if (job.background and not job.preempted and job.stream is not None and not job.stream.finished
+                    and not job.stream.emitted):
                 job.preempted = True
                 self.preemptions += 1
                 self.finish_job(job, reason="preempted")
@@ -650,6 +813,9 @@ class Scheduler:
                     job = self._queue.get_nowait()
                 except queue.Empty:
                     return
+            if job.cancelled:
+                self._finish(job)
+                continue
             if admitted and self.engine.active_count > 0:
                 self._held = job
                 return
@@ -696,7 +862,9 @@ class Scheduler:
             checkpoints_at: list[int] = []
             if self.checkpoints is not None:
                 self._read_disk_block(job.prompt_ids)
-                hit = self.checkpoints.match(job.prompt_ids)
+                from tensorfold.engine.lane_family import reply_room
+
+                hit = self.checkpoints.match(job.prompt_ids, reserve=reply_room(len(job.prompt_ids), job.max_tokens))
                 if hit is not None:
                     cached, cache, last_prompt = hit
                     if self.disk_blocks is not None and cached in job.shared_prefix_lens:
@@ -705,6 +873,8 @@ class Scheduler:
                     *choose_checkpoints(job.history_len, cached, last_prompt, job.prompt_ids),
                     *(n for n in job.shared_prefix_lens if cached < n < len(job.prompt_ids)),
                 })
+            anchor_at, tail_at = self._anchor(job.prompt_ids, cached, checkpoints_at)
+            checkpoints_at = sorted({*checkpoints_at, *(at for at in (anchor_at, tail_at) if at)})
             proposer = job.proposer
             if proposer is None and job.drafts and self.proposer_factory is not None:
                 proposer = self.proposer_factory()
@@ -726,7 +896,12 @@ class Scheduler:
             if self.checkpoints is not None:
                 for tokens, snapshot in stream.history_checkpoints:
                     shared = len(tokens) in job.shared_prefix_lens
-                    self.checkpoints.insert(tokens, snapshot, last_prompt=job.prompt_ids, pinned=shared)
+                    anchored = bool(anchor_at) and len(tokens) == anchor_at and not shared
+                    self.checkpoints.insert(tokens, snapshot, last_prompt=job.prompt_ids, pinned=shared,
+                                            anchor=anchored)
+                    if anchored:
+                        print(f"[tensorfold] anchor checkpoint tokens={len(tokens)} (prompt={len(job.prompt_ids)} "
+                              f"cached={cached}: shares this prefix with an earlier prompt)", flush=True)
                     if self.snapshot_dir is not None and shared:
                         self._persist(tokens, snapshot)
             stream.history_checkpoints = []
@@ -743,6 +918,32 @@ class Scheduler:
             print(f"[tensorfold] start failed {job.job_id} cached={job.cached_tokens}: {type(exc).__name__}: {exc}",
                   flush=True)
             self._finish(job)
+
+    def _anchor(self, prompt: list[int], cached: int, checkpoints_at: list[int]) -> tuple[int, int]:
+        """(divergence anchor, tail checkpoint) positions for this prompt, 0 for none (TF_PREFIX_ANCHORS; see
+        ANCHOR_BACKOFF). Remembers the prompt for the next request."""
+
+        if not self.anchors or self.checkpoints is None:
+            return 0, 0
+        at = tail = 0
+        cached = int(cached)
+        try:
+            if len(prompt) - cached > ANCHOR_MIN_GAIN + ANCHOR_BACKOFF:
+                with self.checkpoints._lock:
+                    others = [entry.tokens for entry in self.checkpoints._entries]
+                shared = max((common_prefix_len(prompt, other) for other in [*self._recent_prompts, *others]),
+                             default=0)
+                candidate = min(shared, len(prompt) - 1) - ANCHOR_BACKOFF
+                if candidate - cached >= ANCHOR_MIN_GAIN and candidate not in checkpoints_at:
+                    at = candidate
+            candidate = len(prompt) - TAIL_BACKOFF
+            if (len(prompt) - cached >= TAIL_MIN_PREFILL and candidate > max(cached, at)
+                    and all(abs(candidate - b) >= ANCHOR_MIN_GAIN for b in checkpoints_at)):
+                tail = candidate
+        except Exception as exc:  # noqa: BLE001 - an anchor only saves a later prefill
+            print(f"[tensorfold] anchor search failed: {type(exc).__name__}: {exc}", flush=True)
+        self._recent_prompts.append(list(prompt))
+        return at, tail
 
     def _persist(self, tokens: list[int], cache: list[Any]) -> None:
         """Write a system-block snapshot to disk once, so a restart does not lose it."""
@@ -839,10 +1040,14 @@ class ChatApp:
         self.stop_ids = eos_ids_of(tokenizer)
         self.engine = factory(model, max_rows=int(max_rows), max_draft=int(max_draft), pending_cap=int(pending_cap),
                               retain_finished_caches=int(checkpoint_slots) > 0)
+        # Off unless asked for (a deep-prompt setup sets both): TF_PREFIX_ANCHORS=1 takes divergence anchors,
+        # TF_PREFIX_SHARE=1 lets nested entries share KV arrays (model families with their own caches only)
+        anchors = _env_flag("TF_PREFIX_ANCHORS")
+        share = _env_flag("TF_PREFIX_SHARE") and bool(getattr(model, "lane_family", False))
         self.checkpoints = (
             CheckpointStore(int(checkpoint_slots), copier=self.engine.copy_single_cache,
                             budget_bytes=checkpoint_budget_bytes, sizer=self.engine.cache_nbytes,
-                            pinned_slots=max(3, self.max_snapshots))
+                            pinned_slots=max(3, self.max_snapshots), share_prefixes=share)
             if int(checkpoint_slots) > 0 else None
         )
         self.requests_completed = 0
@@ -864,7 +1069,12 @@ class ChatApp:
             snapshot_dir=snapshot_dir,
             session_dir=None if snapshot_dir is None else Path(snapshot_dir).parent / "session-snapshots",
             model_id=model_id,
+            anchors=anchors,
         )
+        if anchors or share:
+            compact = os.environ.get("TF_CACHE_COMPACT", "").strip() not in ("", "0")
+            print(f"[tensorfold] prompt cache: divergence anchors {'on' if anchors else 'off'}, "
+                  f"shared prefix KV {'on' if share else 'off'}{', compact copies on' if compact else ''}", flush=True)
         loaded_count = 0
         if snapshot_dir is not None and self.checkpoints is not None:
             from tensorfold.engine.prefix_snapshots import load_snapshots
@@ -1072,10 +1282,38 @@ class ChatApp:
         visible_text = IncrementalText(self.tokenizer, self.tokenizer_lock)
         replay: list[int] = []        # tokens a preempted job already delivered, owed again by its rerun
         preemptions = 0
+        alive = getattr(CLIENT, "alive", None)
+        checked = time.perf_counter()
+        if on_delta is not None:
+            # a streamed write that fails means the client is gone: stop the job before the error leaves this
+            # handler, or the engine decodes on for nobody up to max_tokens (an agent killed at its cap mid-stream)
+            write = on_delta
+
+            def on_delta(delta: Any) -> None:
+                try:
+                    write(delta)
+                except BaseException:
+                    if not job.cancelled:
+                        job.cancelled = True
+                        print(f"[tensorfold] client gone (write failed): stopping {job.job_id}", flush=True)
+                    self.scheduler.finish_job(job, reason="cancelled")
+                    raise
         while True:
-            chunk = job.chunks.get()
+            try:
+                chunk = job.chunks.get(timeout=1.0)
+            except queue.Empty:
+                chunk = []
+            if alive is not None and time.perf_counter() - checked >= 1.0:
+                checked = time.perf_counter()
+                if job.cancelled or not alive():
+                    if not job.cancelled:
+                        job.cancelled = True
+                        print(f"[tensorfold] client gone: stopping {job.job_id}", flush=True)
+                    self.scheduler.finish_job(job, reason="cancelled")   # again: it may have started since
+            if chunk == []:
+                continue
             if chunk is None:
-                if job.preempted and job.error is None:
+                if job.preempted and job.error is None and not job.cancelled:
                     # a user's request took the engine: run again from the start (same prompt and sampling, so the
                     # same tokens) and drop what was already delivered
                     preemptions += 1
@@ -1178,12 +1416,14 @@ class ChatApp:
         print(
             f"[tensorfold] done {job.job_id} prompt={len(prompt_ids)} cached={job.cached_tokens} "
             f"tokens={len(collected)} sha={_token_sha(collected)} finish={reply['finish_reason']} "
-            f"tok/s={reply['runtime']['tokens_per_second']:.1f} "
+            + (f"seed={job.sampling.seed} " if getattr(job, "sampling", None) is not None else "")
+            + f"tok/s={reply['runtime']['tokens_per_second']:.1f} "
             f"ttft={(first_token_at - received_at) if first_token_at else -1:.2f}s "
             f"prefill={max(0.0, job.prefilled_at - job.started_at) if job.started_at and job.prefilled_at else -1:.2f}s "
             + (f"background preemptions={preemptions} " if background else "")
             + f"rounds={stream.rounds if stream else 0} "
             f"accepted={stream.accepted if stream else 0}/{stream.drafted if stream else 0} "
+            + _draft_kinds(stream)
             + self._round_profile(stream)
             + (
                 f"checkpoints={len(store)} ({store.nbytes / 1024**3:.2f} GiB, "
@@ -1198,8 +1438,10 @@ class ChatApp:
     def _resolve_sampling(self, fields: dict[str, Any] | None, temperature: float,
                           prompt_ids: list[int]) -> Any:
         """The request's exact sampling, or None for greedy decoding. Fields the request leaves out come from the
-        server's defaults (the model's generation_config.json, or the CLI's sampling flags); the seed defaults to
-        a hash of the prompt, so the same conversation samples the same reply."""
+        server's defaults (the model's generation_config.json, or the CLI's sampling flags). A request without a
+        seed gets a random one (logged with the request, so it can be replayed): repeats of one prompt are then
+        independent draws, as in llama.cpp's server. TF_SEED=prompt restores the earlier default, a hash of the
+        prompt, under which the same conversation always samples the same reply."""
 
         from tensorfold.engine.exact_sampling import Sampling, seed_for
 
@@ -1210,7 +1452,12 @@ class ChatApp:
             return None   # temperature 0: greedy
         top_p = float(fields.get("top_p", base.get("top_p", 1.0)) or 1.0)
         top_k = int(fields.get("top_k", base.get("top_k", 0)) or 0)
-        seed = int(fields["seed"]) if fields.get("seed") is not None else seed_for(prompt_ids)
+        if fields.get("seed") is not None:
+            seed = int(fields["seed"])
+        elif os.environ.get("TF_SEED", "random") == "prompt":
+            seed = seed_for(prompt_ids)
+        else:
+            seed = int.from_bytes(os.urandom(8), "little") & ((1 << 63) - 1)
         return Sampling(seed=seed, temperature=temp, top_k=top_k, top_p=top_p)
 
     def _think_close(self) -> tuple[tuple[int, ...], int]:
