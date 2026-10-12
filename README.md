@@ -1,3 +1,34 @@
+# TensorFold-flash-next
+
+A fork of [TensorFold](https://github.com/ashhart/TensorFold) that serves ISTA-DASLab's
+[IQ1_M Coder GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) of Qwen3.8-Flash-Next,
+with 768 of its 12,288 routed experts removed, on 48 GB Apple Silicon Macs. It adds:
+
+- reading llama.cpp GGUF tensors through mlx-kquant, mostly in place, including expert files cut to a subset;
+- drafting with a GGUF MTP head, enabled only if a load-time check finds bit-identical logits for drafted windows and
+  one-token steps;
+- lower transient memory, sparse prefill attention and extra prompt-cache checkpoints for long prompts;
+- a server that stops generating for disconnected clients and does not preempt a background request, such as a
+  session title, once it has produced a token.
+
+Most model-side additions are off by default; the Hugging Face setup below turns on the ones it uses. Details:
+[docs/flash-next-gguf.md](docs/flash-next-gguf.md).
+
+## Use
+
+The model, an installer pinned to this fork and the measured results are on Hugging Face:
+[Schiltmans/Qwen3.8-Flash-Next-Coder-cut240](https://huggingface.co/Schiltmans/Qwen3.8-Flash-Next-Coder-cut240).
+
+```sh
+uvx --from huggingface_hub hf download Schiltmans/Qwen3.8-Flash-Next-Coder-cut240 --local-dir Flash-Next-Coder-cut240
+cd Flash-Next-Coder-cut240
+./install.sh && ./setup.sh && ./serve.sh
+```
+
+Everything else is upstream TensorFold, whose README follows unchanged.
+
+---
+
 ![TensorFold mesh and measured decode speeds for Qwen3.8 27B, Nemotron 3.5, and Qwen3.8 Flash Next](assets/tensorfold-hero-speeds.png)
 
 # TensorFold
