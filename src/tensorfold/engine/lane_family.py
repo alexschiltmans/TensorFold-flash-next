@@ -80,6 +80,71 @@ def drop_spares(cache: list[Any]) -> list[Any]:
     return drop(cache)
 
 
+def _ckpt_share() -> bool:
+    """TF_CKPT_SHARE=1 (with TF_CACHE_COMPACT=1): the checkpoints one prefill takes share one KV copy."""
+
+    on = os.environ.get("TF_CKPT_SHARE", "").strip() not in ("", "0")
+    return on and os.environ.get("TF_CACHE_COMPACT", "").strip() not in ("", "0")
+
+
+def _snapshot_without_kv(engine: Any, cache: list[Any]) -> list[Any]:
+    """A prefill checkpoint before the prefill's last one (TF_CKPT_SHARE). Attention layers are cloned as
+    ``copy_compact`` clones them (offset, pooled block keys, the drafted flag) but without their KV arrays, plus a
+    one-position fingerprint of their keys; ``_share_last_kv`` then points them at the last checkpoint's arrays.
+    Every other layer (DeltaNet state) is copied as ``copy_single_cache`` copies it. Within one prefill the KV is
+    append-only, so the last checkpoint's arrays hold every earlier checkpoint's positions unchanged (the
+    stored-prefix sharing of TF_PREFIX_SHARE relies on the same property). Without sharing, each checkpoint holds its
+    own KV copy until the prefill ends, about 0.9 GiB each at a 30K-token prompt."""
+
+    import mlx.core as mx
+
+    out: list[Any] = []
+    for item in cache:
+        if hasattr(item, "copy_compact") and getattr(item, "keys", None) is not None and item.offset > 0:
+            clone = type(item)()
+            if "drafted" in item.__dict__:
+                clone.drafted = item.drafted
+            clone.offset = n = item.offset
+            clone.pooled = None if item.pooled is None else mx.array(item.pooled)
+            clone.__dict__["_kv_pending"] = mx.array(item.keys[:, :, n - 1:n])   # fingerprint: the last position
+            out.append(clone)
+        else:
+            out.append(engine.copy_single_cache([item])[0])
+    pending = [c.__dict__["_kv_pending"] for c in out if "_kv_pending" in c.__dict__]
+    if pending:
+        mx.eval(*pending)
+    return drop_spares(out)
+
+
+def _share_last_kv(checkpoints: list[tuple[list[int], list[Any]]]) -> list[tuple[list[int], list[Any]]]:
+    """The prefill's checkpoints with the earlier ones' attention layers pointing at the last checkpoint's KV
+    arrays (``_snapshot_without_kv``). The fingerprint is a sanity check, not a proof of equality: an earlier
+    checkpoint whose layers do not match the last one's (layer count, type, length or the fingerprinted key
+    position) is left out, so the prompt cache only loses that entry."""
+
+    import mlx.core as mx
+
+    final = checkpoints[-1][1]
+    kept: list[tuple[list[int], list[Any]]] = []
+    for tokens, snap in checkpoints[:-1]:
+        pairs = [(a, b) for a, b in zip(snap, final) if "_kv_pending" in a.__dict__]
+        ok = len(snap) == len(final)
+        for a, b in pairs:
+            mark = a.__dict__.pop("_kv_pending")
+            n = a.offset
+            ok = (ok and type(a) is type(b) and b.keys is not None and b.offset >= n
+                  and bool(mx.array_equal(b.keys[:, :, n - 1:n], mark).item()))
+        if not ok:
+            print(f"[tensorfold] TF_CKPT_SHARE: checkpoint at {len(tokens)} does not match the prefill's last one: "
+                  "left out", flush=True)
+            continue
+        for a, b in pairs:
+            a.keys, a.values, a.index_keys = b.keys, b.values, b.index_keys
+        kept.append((tokens, snap))
+    kept.append(checkpoints[-1])
+    return kept
+
+
 def cache_arrays(cache: list[Any]) -> list[Any]:
     """Every array a cache list holds (a KV cache nothing was written to yet has none)."""
 
@@ -184,13 +249,18 @@ class FamilyRounds:
             if room and reserve is not None:
                 reserve(room)
         stream.history_checkpoints = []
-        for boundary in sorted({int(b) for b in checkpoints_at}):
-            if not start < boundary < len(stream.prompt_ids):
-                continue
+        bounds = [b for b in sorted({int(b) for b in checkpoints_at}) if start < b < len(stream.prompt_ids)]
+        # TF_CKPT_SHARE: one KV copy per prefill (see _snapshot_without_kv)
+        share = len(bounds) > 1 and _ckpt_share()
+        for i, boundary in enumerate(bounds):
             self._family_feed(stream.prompt_ids[start:boundary], work, following=stream.prompt_ids[boundary])
-            stream.history_checkpoints.append((list(stream.prompt_ids[:boundary]),
-                                               drop_spares(self.copy_single_cache(work))))
+            last = i == len(bounds) - 1
+            snap = (_snapshot_without_kv(self, work) if share and not last
+                    else drop_spares(self.copy_single_cache(work)))
+            stream.history_checkpoints.append((list(stream.prompt_ids[:boundary]), snap))
             start = boundary
+        if share:
+            stream.history_checkpoints = _share_last_kv(stream.history_checkpoints)
         hidden = self._family_feed(stream.prompt_ids[start:], work)
         prompt_len = len(stream.prompt_ids)
         stream.emitted = []
