@@ -8,6 +8,8 @@ with 768 of its 12,288 routed experts removed, on 48 GB Apple Silicon Macs. It a
 - drafting with a GGUF MTP head, enabled only if a load-time check finds bit-identical logits for drafted windows and
   one-token steps;
 - lower transient memory, sparse prefill attention and extra prompt-cache checkpoints for long prompts;
+- prompt-cache entries and checkpoints that share the pages holding a common prefix's sparse-attention KV (off by
+  default; [docs/kv-pages.md](docs/kv-pages.md));
 - a server that stops generating for disconnected clients and does not preempt a background request, such as a
   session title, once it has produced a token.
 

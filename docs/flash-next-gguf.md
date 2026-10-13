@@ -1,8 +1,9 @@
 # What this fork adds
 
 The fork's code changes are in commits
-[`995297c`](https://github.com/alexschiltmans/TensorFold-flash-next/commit/995297cb368bfa0f0490c55fd2a2ddf4d6888d75)
-and [`9ee55d5`](https://github.com/alexschiltmans/TensorFold-flash-next/commit/9ee55d5268f403957ac86c8d9c3e6bd2633b6e15),
+[`995297c`](https://github.com/alexschiltmans/TensorFold-flash-next/commit/995297cb368bfa0f0490c55fd2a2ddf4d6888d75),
+[`9ee55d5`](https://github.com/alexschiltmans/TensorFold-flash-next/commit/9ee55d5268f403957ac86c8d9c3e6bd2633b6e15)
+and [`7b44450`](https://github.com/alexschiltmans/TensorFold-flash-next/commit/7b44450e003c89a36e80247a0a59bbc9abac051c),
 based on upstream commit
 [`2f8e514`](https://github.com/ashhart/TensorFold/commit/2f8e514b0b7d615df7c971627ce3c0fb7e55d93a).
 
@@ -20,6 +21,8 @@ based on upstream commit
 - Extra prompt-cache checkpoints where a prompt diverges from an earlier one and near the end of long prompts, with
   nested entries sharing KV (`TF_PREFIX_ANCHORS`, `TF_PREFIX_SHARE`); the checkpoints one prefill takes share one KV
   copy (`TF_CKPT_SHARE`, with `TF_CACHE_COMPACT`).
+- Prompt-cache entries and prefill checkpoints that share their sparse-attention KV in pages, while the request being
+  served keeps contiguous buffers (`TF_KV_PAGED`, `TF_KV_POOL_PAGES`; [kv-pages.md](kv-pages.md)).
 - Four other changes to the server: it stops generating for a disconnected client, no longer preempts a background
   request such as a session title once that request has produced a token, picks a random seed when a request sends
   none (`TF_SEED=prompt` restores upstream's prompt hash), and converts string tool-call arguments to their schema
