@@ -481,11 +481,23 @@ class FlashNext:
         return caches
 
     def adopt_cache(self, cache: list[Any]) -> list[Any]:
-        """A stored or copied cache without an MTP entry gets an empty one (drafts then see less context)."""
+        """A stored or copied cache without an MTP entry gets an empty one (drafts then see less context). With
+        TF_KV_PAGED=1 its plain attention layers become ``paged_kv.HybridAttentionCache`` (``paged_kv.adopt``)."""
 
         if self.mtp is not None and len(cache) == self.layer_count:
             cache.append(MTPCache())
-        return cache
+        from tensorfold.families.qwen4_exp import paged_kv
+
+        return paged_kv.adopt(cache) if paged_kv.enabled() else cache
+
+    def attach_prompt_cache(self, *, evict: Any, context_window: int) -> None:
+        """Called by the server once its prompt cache exists. TF_KV_PAGED=1: the page pools take their size from
+        the context window and evict the cache's least recently used entries when full (``paged_kv.attach``)."""
+
+        from tensorfold.families.qwen4_exp import paged_kv
+
+        if paged_kv.enabled():
+            paged_kv.attach(evict, context_window)
 
     # Prompts through the decode kernels, ``fused_rows`` rows at a time: each prompt row then gets a one-row step's
     # bits whatever the chunking, so a prompt resumed from any cached prefix (a checkpoint, a finished reply's

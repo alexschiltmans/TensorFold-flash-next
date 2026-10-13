@@ -15,8 +15,14 @@ batch-cache protocol:
     window_costs                     {rows: ms} of a forward, timed at load for every exact width
     gpu_tokens                       ``hidden`` takes unread GPU token arrays: one-token rounds run one step ahead
     adopt_cache(cache)               optional: a stored or copied cache in the model's own classes
+    attach_prompt_cache(evict=, context_window=)
+                                     optional: called by the server once its prompt cache exists, with the cache's
+                                     ``evict_lru`` and the served window
 
-and with a draft head (``mtp`` set):
+A layer cache's optional ``store_copy()`` is what a prefill checkpoint or a prompt-cache entry keeps of it
+(``checkpoint_copy``; the server's ``CheckpointStore.insert``).
+
+With a draft head (``mtp`` set):
 
     absorb_draft_context(hidden, next_tokens, cache)       prompt positions into the head's cache
     speculate(cache, tokens, position, sampling, start=0, last_only=False)
@@ -84,7 +90,21 @@ def _ckpt_share() -> bool:
     """TF_CKPT_SHARE=1 (with TF_CACHE_COMPACT=1): the checkpoints one prefill takes share one KV copy."""
 
     on = os.environ.get("TF_CKPT_SHARE", "").strip() not in ("", "0")
+    if os.environ.get("TF_KV_PAGED", "").strip() not in ("", "0"):
+        return False            # TF_KV_PAGED: the checkpoints share KV pages instead (checkpoint_copy)
     return on and os.environ.get("TF_CACHE_COMPACT", "").strip() not in ("", "0")
+
+
+def checkpoint_copy(engine: Any, cache: list[Any]) -> list[Any]:
+    """A prefill checkpoint of ``cache`` for the prompt cache: ``copy_single_cache``, except that a layer with
+    ``store_copy`` (a family's stored form of it, e.g. TF_KV_PAGED's KV pages) gives that instead."""
+
+    if not any(callable(getattr(item, "store_copy", None)) for item in cache):
+        return drop_spares(engine.copy_single_cache(cache))
+    rest = [item for item in cache if not callable(getattr(item, "store_copy", None))]
+    copies = iter(engine.copy_single_cache(rest))       # copies item by item: a filtered list is fine
+    return drop_spares([item.store_copy() if callable(getattr(item, "store_copy", None)) else next(copies)
+                        for item in cache])
 
 
 def _snapshot_without_kv(engine: Any, cache: list[Any]) -> list[Any]:
@@ -256,7 +276,7 @@ class FamilyRounds:
             self._family_feed(stream.prompt_ids[start:boundary], work, following=stream.prompt_ids[boundary])
             last = i == len(bounds) - 1
             snap = (_snapshot_without_kv(self, work) if share and not last
-                    else drop_spares(self.copy_single_cache(work)))
+                    else checkpoint_copy(self, work))
             stream.history_checkpoints.append((list(stream.prompt_ids[:boundary]), snap))
             start = boundary
         if share:

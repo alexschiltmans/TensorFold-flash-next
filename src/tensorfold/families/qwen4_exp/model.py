@@ -396,6 +396,19 @@ class AttentionCache:
         return self.keys[:, :, :end], self.values[:, :, :end], self.index_keys[:, :end]
 
 
+def attention_cache(layer: int) -> AttentionCache:
+    """Layer ``layer``'s sparse-attention cache: an AttentionCache, or with TF_KV_PAGED=1 a
+    ``paged_kv.HybridAttentionCache``, whose prompt-cache copies are pages of a per-layer pool."""
+
+    if os.environ.get("TF_KV_PAGED", "").strip() in ("", "0"):
+        return AttentionCache()
+    if not cache_compact():
+        raise RuntimeError("TF_KV_PAGED=1 needs TF_CACHE_COMPACT=1 (stored copies are made by copy_compact)")
+    from tensorfold.families.qwen4_exp.paged_kv import HybridAttentionCache
+
+    return HybridAttentionCache(layer)
+
+
 def _own_tail(x: mx.array, rows: int) -> mx.array:
     """The last ``rows`` rows of ``x`` [B, L, C] for a cache. A slice is a view that keeps all of ``x``'s buffer
     alive (a 2,048-row DeltaNet conv input is 42 MB, so 36 layers held 1.5 GB between prompt chunks); a call
@@ -1055,7 +1068,7 @@ class Qwen4Exp(nn.Module):
         return self.model.layers
 
     def make_cache(self) -> list[Any]:
-        return [LinearCache() if layer.is_linear else AttentionCache() for layer in self.layers]
+        return [LinearCache() if layer.is_linear else attention_cache(i) for i, layer in enumerate(self.layers)]
 
     def hidden(self, inputs: Any, cache: list[Any]) -> mx.array:
         """The mixed hidden state [B, L, D] after the last layer."""

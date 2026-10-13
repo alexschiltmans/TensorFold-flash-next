@@ -201,8 +201,8 @@ def share_prefix_kv(older: list[Any], newer: list[Any]) -> int:
     found: list[tuple[Any, str, Any, int]] = []
     checks: list[Any] = []
     for a, b in zip(older, newer):
-        if type(a) is not type(b):
-            continue
+        if type(a) is not type(b) or callable(getattr(a, "page_refs", None)):
+            continue                # a paged layer shares its pages already (its index keys need not start at 0)
         n = getattr(a, "offset", None)
         m = getattr(b, "offset", None)
         if not isinstance(n, int) or not isinstance(m, int) or not 0 < n <= m:
@@ -235,13 +235,19 @@ def share_prefix_kv(older: list[Any], newer: list[Any]) -> int:
 
 
 def unique_cache_bytes(caches: Any) -> int:
-    """Bytes of the distinct MLX arrays the given cache lists hold (arrays shared between entries count once)."""
+    """Bytes of the distinct MLX arrays the given cache lists hold (arrays shared between entries count once). A layer
+    cache that holds pages of a shared pool (``page_refs()``, ``page_bytes()``: TF_KV_PAGED) counts each page once."""
 
     import mlx.core as mx
 
-    seen: dict[int, int] = {}
+    seen: dict[Any, int] = {}
     for cache in caches:
         for item in cache:
+            refs = getattr(item, "page_refs", None)
+            if callable(refs):
+                size = int(item.page_bytes())
+                for ref in refs():
+                    seen[("page", ref)] = size
             for value in vars(item).values():
                 values = value if isinstance(value, (list, tuple)) else (value,)
                 for v in values:
@@ -458,13 +464,16 @@ class CheckpointStore:
         # the budget counts distinct arrays
         self.share_prefixes = bool(share_prefixes)
         self._entries: list[CheckpointEntry] = []
-        self._lock = threading.Lock()
+        # reentrant, so evict_lru (which a full page pool calls) is safe in code that already holds it
+        self._lock = threading.RLock()
+        # entries hold pages of a shared pool (``page_refs``): the budget counts distinct pages and arrays
+        self._paged = False
         self.hits = 0
         self.misses = 0
         self.evictions = 0
 
     def _bytes(self, entries: list[CheckpointEntry]) -> int:
-        if self.share_prefixes:
+        if self.share_prefixes or self._paged:
             return unique_cache_bytes(entry.cache for entry in entries)
         return sum(entry.nbytes for entry in entries)
 
@@ -506,7 +515,16 @@ class CheckpointStore:
                pinned: bool = False, anchor: bool = False) -> None:
         if not tokens:
             return
-        nbytes = int(self.sizer(cache)) if self.sizer is not None else 0
+        # a layer cache with ``store_copy()`` is stored in that form: with TF_KV_PAGED a finished request's contiguous
+        # buffers become pages shared with the entry it was resumed from (the caller drops the original)
+        if any(callable(getattr(item, "store_copy", None)) for item in cache):
+            cache = [item.store_copy() if callable(getattr(item, "store_copy", None)) else item for item in cache]
+        paged = any(callable(getattr(item, "page_refs", None)) for item in cache)
+        if paged:
+            self._paged = True
+            nbytes = unique_cache_bytes([cache])     # ``state`` leaves the pages out
+        else:
+            nbytes = int(self.sizer(cache)) if self.sizer is not None else 0
         with self._lock:
             replaced = [entry for entry in self._entries if entry.tokens == list(tokens)]
             kept = [entry for entry in self._entries if entry.tokens != list(tokens)]
@@ -546,6 +564,32 @@ class CheckpointStore:
                     break
                 self.evictions += 1
             self._entries = entries
+
+    def evict_lru(self) -> bool:
+        """Drop the least recently used entry, conversations before divergence anchors before pinned system blocks,
+        for a model whose entries hold pages of a pool with no free page left (``attach_prompt_cache``). The entry
+        last used goes too when nothing else is left; pinned system blocks never do (the copy that needs the page is
+        made contiguous instead). False when no unpinned entry is left."""
+
+        import gc
+
+        with self._lock:
+            entries = self._entries
+            if not entries:
+                return False
+            order = ([i for i, e in enumerate(entries) if not e.pinned and not e.anchor]
+                     or [i for i, e in enumerate(entries) if not e.pinned])
+            if not order:
+                return False
+            dropped = entries.pop(order[-1])
+            self.evictions += 1
+        tokens = len(dropped.tokens)
+        # the layers give their pages back in __del__ (CPython frees the entry when this last reference goes);
+        # collect in case a reference cycle holds it
+        del dropped
+        gc.collect()
+        print(f"[tensorfold] prompt cache: evicted a {tokens}-token entry for KV pages", flush=True)
+        return True
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -1050,6 +1094,11 @@ class ChatApp:
                             pinned_slots=max(3, self.max_snapshots), share_prefixes=share)
             if int(checkpoint_slots) > 0 else None
         )
+        # a model whose prompt-cache entries hold pages of a fixed pool (Flash Next with TF_KV_PAGED=1) sizes the
+        # pool for this window and frees pages by evicting the store's least recently used entries
+        attach = getattr(model, "attach_prompt_cache", None)
+        if self.checkpoints is not None and callable(attach):
+            attach(evict=self.checkpoints.evict_lru, context_window=self.context_window)
         self.requests_completed = 0
         # background (title) requests wait this long, and while a user's request is being prepared, before they
         # are submitted, so a session's first turn, sent just after, is admitted first

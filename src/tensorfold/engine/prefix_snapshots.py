@@ -50,6 +50,9 @@ def save_snapshot(directory: Path, model_id: str, tokens: Sequence[int], cache: 
     arrays: dict[str, mx.array] = {}
     layers: list[dict[str, Any]] = []
     for index, item in enumerate(cache):
+        export = getattr(item, "snapshot_copy", None)
+        if callable(export):
+            item = export()     # a layer whose state lives outside it (TF_KV_PAGED's pool) writes a self-contained copy
         cls = type(item)
         entry: dict[str, Any] = {"class": f"{cls.__module__}:{cls.__qualname__}", "plain": {},
                                  "arrays": [], "lists": {}, "numpy": []}
