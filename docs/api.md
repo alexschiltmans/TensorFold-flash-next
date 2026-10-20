@@ -1,6 +1,6 @@
 # The OpenAI-compatible API
 
-`tensorfold serve` listens at `http://HOST:PORT/v1`.
+`tensorfold serve` listens at `http://HOST:PORT/v1` (default `http://127.0.0.1:8080/v1`).
 
 | Route | What it does |
 | --- | --- |
@@ -30,6 +30,22 @@ caller receives the same tokens.
 | `priority` | `"background"`: yield to every other request (TensorFold extension) |
 
 Not supported yet: `stop`, `n` > 1, `logprobs`, images.
+
+## Access checks
+
+Every request passes these before its route runs:
+
+| Check | Refused with |
+| --- | --- |
+| `Host` must be `127.0.0.1`, `localhost` or `[::1]` with the server's port, or a `--allowed-host` entry | 403 |
+| an `Origin` header must be a `--allowed-origin` entry (none by default; clients outside a browser send no `Origin`) | 403 |
+| with `--api-key` (or `TENSORFOLD_API_KEY`) set: `Authorization: Bearer <key>` on every route but `GET /health` | 401 |
+| the body must have a `Content-Length` of at most `--max-body-mib` (16 MiB) | 411 (chunked), 413 (too large) |
+
+The Host check stops a web page that points its own domain at 127.0.0.1 (DNS rebinding) from reading replies;
+the Origin check refuses requests a browser sends on behalf of another site. A refused request's body is read and dropped, or the
+connection closed, so it is never taken as the next request. Without `--api-key`, an `Authorization` header is
+ignored, so clients configured with a placeholder key keep working.
 
 A prompt longer than the server's context window gets HTTP 400 (`invalid_request_error`); in a stream, an
 `error` event.

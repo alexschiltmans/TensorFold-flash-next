@@ -21,9 +21,10 @@ import threading
 import time
 import uuid
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Callable
+
+from tensorfold.server.guard import BodyError, GuardedHandler, ServerPolicy
 
 _THINK_END = "</think>"
 _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
@@ -291,9 +292,12 @@ class App:
                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "stats": stats}
 
 
-def make_handler(app: App):
-    class Handler(BaseHTTPRequestHandler):
+def make_handler(app: App, policy: ServerPolicy | None = None):
+    guard_policy = policy if policy is not None else ServerPolicy()
+
+    class Handler(GuardedHandler):
         protocol_version = "HTTP/1.1"
+        policy = guard_policy
 
         def log_message(self, fmt, *args):  # quiet
             pass
@@ -306,7 +310,7 @@ def make_handler(app: App):
             self.end_headers()
             self.wfile.write(data)
 
-        def do_GET(self):
+        def handle_get(self):
             if self.path.rstrip("/") in ("/v1/models", "/models"):
                 self._json(200, {"object": "list", "data": [{"id": app.served, "object": "model", "owned_by": "tensorfold"}]})
             elif self.path.rstrip("/") in ("/health", "/v1/health"):
@@ -314,12 +318,16 @@ def make_handler(app: App):
             else:
                 self._json(404, {"error": "not found"})
 
-        def do_POST(self):
+        def handle_post(self):
             chat = self.path.rstrip("/").endswith("/chat/completions")
             if not chat and not self.path.rstrip("/").endswith("/completions"):
-                return self._json(404, {"error": "not found"})
+                return self._json(404, {"error": "not found"})      # its body is dropped, not read as a request
             try:
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                raw = self.read_body()
+            except BodyError as exc:
+                return self.send_refusal(exc.status, str(exc))
+            try:
+                body = json.loads(raw or b"{}")
             except json.JSONDecodeError:
                 return self._json(400, {"error": {"message": "the request body is not JSON", "type": "invalid_request_error"}})
             problem = app.check(body)
@@ -395,7 +403,7 @@ def make_handler(app: App):
     return Handler
 
 
-def serve(app: App, host: str, port: int) -> None:
+def serve(app: App, host: str, port: int, policy: ServerPolicy | None = None) -> None:
     """Serve until interrupted (SIGTERM included)."""
 
     import signal
@@ -405,7 +413,7 @@ def serve(app: App, host: str, port: int) -> None:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, _terminate)
-    server = ThreadingHTTPServer((host, port), make_handler(app))
+    server = ThreadingHTTPServer((host, port), make_handler(app, policy))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

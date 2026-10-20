@@ -155,7 +155,15 @@ docker run -it --gpus all --ipc=host --network host -v ~/.cache/huggingface:/roo
   nvcr.io/nvidia/pytorch:26.07-py3
 pip install git+https://github.com/ashhart/TensorFold.git
 tensorfold pull Vontra/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
-tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --host 0.0.0.0
+tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit
+```
+
+That serves this machine only (127.0.0.1). To serve other machines on your network, set an API key and name the
+host clients use:
+
+```bash
+export TENSORFOLD_API_KEY=$(openssl rand -hex 32)   # clients send it as "Authorization: Bearer <key>"
+tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --host 0.0.0.0 --allowed-host spark.lan
 ```
 
 Two Sparks split a model between them over their direct link. Run the same command on each, rank 1 first, with
@@ -165,8 +173,10 @@ the address rank 0 has on that link. Rank 0 serves HTTP. The container also need
 docker run -it --gpus all --ipc=host --network host --device /dev/infiniband --ulimit memlock=-1 \
   --cap-add IPC_LOCK -v ~/.cache/huggingface:/root/.cache/huggingface nvcr.io/nvidia/pytorch:26.07-py3
 tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --tp 2 --rank 1 --master 192.168.100.1   # on the second Spark
-tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --tp 2 --rank 0 --master 192.168.100.1 --host 0.0.0.0
+tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --tp 2 --rank 0 --master 192.168.100.1
 ```
+
+Add `--host 0.0.0.0 --allowed-host NAME` with `TENSORFOLD_API_KEY` set on rank 0 to serve other machines, as above.
 
 Set `NCCL_SOCKET_IFNAME` and `NCCL_IB_HCA` to the link's interface and adapters if NCCL does not find them
 ([the runbook](RUNBOOK.md#dgx-spark) has the steps).
@@ -233,7 +243,11 @@ other versions. `--no-update-check` or `TENSORFOLD_NO_UPDATE_CHECK=1` switches t
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `--host`, `--port` | `127.0.0.1`, `8080` | where to listen (`--host 0.0.0.0` for other machines) |
+| `--host`, `--port` | `127.0.0.1`, `8080` | where to listen; an address other machines reach (such as `0.0.0.0`) starts only with `--allowed-host` and an API key |
+| `--allowed-host NAME` | none | a Host value to answer besides `127.0.0.1`, `localhost` and `[::1]` on `--port` (`NAME`: any port, `NAME:PORT`: that port); repeatable (list every name or address clients use); env `TENSORFOLD_ALLOWED_HOSTS` (comma-separated). Other Host values get 403 |
+| `--allowed-origin URL` | none | a browser origin to answer, such as `http://localhost:3000`; repeatable; env `TENSORFOLD_ALLOWED_ORIGINS`. A request with any other `Origin` header gets 403; clients outside a browser send none. No CORS headers are sent |
+| `--api-key KEY` | env `TENSORFOLD_API_KEY` | require `Authorization: Bearer KEY` on every route but `/health` (401 otherwise); prefer the environment variable, which stays out of the process list |
+| `--max-body-mib N` | 16 | largest request body; larger ones get 413 (env `TENSORFOLD_MAX_BODY_BYTES`, in bytes). Bodies need a `Content-Length` (chunked ones get 411) |
 | `--name`, `--alias` | the model's name | the model id clients send |
 | `--context N` | the model's `max_position_embeddings` | prompt plus reply tokens a request may use; longer prompts get HTTP 400; `0` removes TensorFold's cap |
 | `--max-tokens N` | 4096 | reply length when a request does not set `max_tokens` |

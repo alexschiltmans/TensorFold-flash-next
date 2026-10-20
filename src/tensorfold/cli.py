@@ -37,8 +37,22 @@ def build_parser() -> argparse.ArgumentParser:
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     serve.add_argument("model", help="a Hugging Face repo id (downloaded on first use) or a model directory")
     endpoint = serve.add_argument_group("endpoint")
-    endpoint.add_argument("--host", default="127.0.0.1", help="address to listen on (0.0.0.0: every interface)")
+    endpoint.add_argument("--host", default="127.0.0.1",
+                          help="address to listen on; any address other machines reach also needs --allowed-host "
+                               "and --api-key")
     endpoint.add_argument("--port", type=int, default=8080)
+    endpoint.add_argument("--allowed-host", action="append", default=[],
+                          help="a Host header value to answer besides 127.0.0.1, localhost and [::1] on --port "
+                               "(name: any port; name:port: that port); env TENSORFOLD_ALLOWED_HOSTS, comma-separated")
+    endpoint.add_argument("--allowed-origin", action="append", default=[],
+                          help="a browser Origin to answer (such as http://localhost:3000); requests from any other "
+                               "origin get 403; env TENSORFOLD_ALLOWED_ORIGINS, comma-separated")
+    endpoint.add_argument("--api-key", default=None,
+                          help="require 'Authorization: Bearer KEY' on every route but /health (default: env "
+                               "TENSORFOLD_API_KEY; the environment keeps the key out of the process list)")
+    endpoint.add_argument("--max-body-mib", type=float, default=None,
+                          help="largest request body in MiB; larger ones get 413 (default 16; env "
+                               "TENSORFOLD_MAX_BODY_BYTES in bytes)")
     endpoint.add_argument("--name", default="", help="model id clients ask for (default: the model's name)")
     endpoint.add_argument("--alias", action="append", default=[], help="another model id to answer to")
 
@@ -306,7 +320,7 @@ def _backend(choice: str, family: Any) -> str:
     return backend
 
 
-def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path) -> int:
+def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, policy: Any = None) -> int:
     """Serve with the family's CUDA engine (``cuda_engine``) behind ``tensorfold.cuda.server``."""
 
     from tensorfold import hub
@@ -345,14 +359,33 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path) -> int:
     print(f"[tensorfold] serving {served} at http://{args.host}:{args.port}/v1 on CUDA{where} "
           f"(sampling: {shown}; drafts: {'off' if args.no_drafts else 'on'}; "
           f"loaded in {time.perf_counter() - started:.1f}s)", flush=True)
-    serve(app, args.host, int(args.port))
+    serve(app, args.host, int(args.port), policy)
     return 0
+
+
+def _server_policy(args: argparse.Namespace):  # type: ignore[no-untyped-def]
+    """The request checks from the endpoint flags and their environment variables; refuses a non-loopback --host
+    without an allowlist and an API key before anything loads."""
+
+    from tensorfold.server.guard import ServerPolicy, check_bind
+
+    mib = getattr(args, "max_body_mib", None)
+    policy = ServerPolicy.build(
+        allowed_hosts=list(getattr(args, "allowed_host", None) or []),
+        allowed_origins=list(getattr(args, "allowed_origin", None) or []),
+        api_key=getattr(args, "api_key", None),
+        max_body_bytes=None if mib is None else int(float(mib) * 1024 * 1024),
+    )
+    check_bind(str(args.host), policy)
+    return policy
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
     from http.server import ThreadingHTTPServer
 
     from tensorfold import families, hub
+
+    policy = _server_policy(args)
 
     if not args.no_update_check:
         from tensorfold import update
@@ -379,7 +412,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if needs_full_snapshot and check is not None:
         check(model_dir)                         # checks that need the complete index, such as an MTP head
     if backend == "cuda":
-        return _serve_cuda(args, family, model_dir)
+        return _serve_cuda(args, family, model_dir, policy)
     for key, value in getattr(family.package, "MLX_ENV", {}).items():
         os.environ.setdefault(key, value)       # before MLX starts: it reads them once
 
@@ -450,7 +483,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     hook = getattr(family.package, "setup", None)
     if hook is not None:
         hook(app, model, **options)
-    server = ThreadingHTTPServer((args.host, int(args.port)), make_handler(app))  # type: ignore[arg-type]
+    server = ThreadingHTTPServer((args.host, int(args.port)), make_handler(app, policy))  # type: ignore[arg-type]
     shown = "greedy" if float(sampling.get("temperature", 0.0) or 0.0) <= 0 else ", ".join(
         f"{k} {v}" for k, v in sampling.items())
     print(f"[tensorfold] serving {served} at http://{args.host}:{args.port}/v1 "

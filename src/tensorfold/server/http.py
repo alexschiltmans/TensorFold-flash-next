@@ -3,7 +3,8 @@
 
 ``make_handler(app)`` wraps any app with ``chat(messages, max_tokens=, temperature=, on_delta=, tools=,
 sampling=)``, ``served_name``, ``model_ids``, ``tokenizer`` / ``tokenizer_lock`` and ``exact_mode``
-(``server.app.ChatApp`` is the one TensorFold serves).
+(``server.app.ChatApp`` is the one TensorFold serves). ``policy`` (``server.guard.ServerPolicy``) sets the Host,
+Origin, API-key and body-size checks every request passes first; the default serves loopback clients only.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler
 from typing import Any
+
+from tensorfold.server.guard import BodyError, GuardedHandler, ServerPolicy
 
 # The connection of the request this HTTP thread serves: ``CLIENT.alive()`` is False once the client has hung up
 # (a killed agent), so the app can stop generating for nobody.
@@ -495,9 +498,12 @@ def streaming_visible_text(text: str) -> str:
     return content
 
 
-def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
-    class Handler(BaseHTTPRequestHandler):
+def make_handler(app: Any, policy: ServerPolicy | None = None) -> type[BaseHTTPRequestHandler]:
+    guard_policy = policy if policy is not None else ServerPolicy()
+
+    class Handler(GuardedHandler):
         protocol_version = "HTTP/1.1"
+        policy = guard_policy
 
         def log_message(self, format: str, *args: Any) -> None:
             print(f"[tensorfold] {self.address_string()} {format % args}")
@@ -513,9 +519,9 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
         def _route(self) -> str:
             # Tolerate query strings, trailing slashes, and clients that join
             # the base URL differently (with or without the /v1 prefix).
-            return self.path.split("?", 1)[0].rstrip("/")
+            return self.route()
 
-        def do_GET(self) -> None:
+        def handle_get(self) -> None:
             route = self._route()
             if route in {"", "/health"}:
                 self._send_json(
@@ -543,7 +549,7 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                     }
                 )
                 return
-            self._send_json({"error": {"message": f"unknown path {self.path}"}}, status=404)
+            self.send_refusal(404, f"unknown path {self.path}")
 
         def _legacy_prompt_to_text(self, prompt: Any) -> str:
             if isinstance(prompt, str):
@@ -563,18 +569,22 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                 return messages
             return [{"role": "user", "content": self._legacy_prompt_to_text(body.get("prompt", ""))}]
 
-        def do_POST(self) -> None:
+        def handle_post(self) -> None:
             CLIENT.alive = lambda sock=self.connection: _connection_alive(sock)
             route = self._route()
             is_chat_completion = route.endswith("/chat/completions")
             is_text_completion = route.endswith("/completions") and not is_chat_completion
             if not is_chat_completion and not is_text_completion:
-                self._send_json({"error": {"message": f"unknown path {self.path}"}}, status=404)
+                self.send_refusal(404, f"unknown path {self.path}")      # its body is dropped, not read as a request
+                return
+            try:
+                raw = self.read_body()
+            except BodyError as exc:
+                self.send_refusal(exc.status, str(exc))
                 return
 
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                body = json.loads(self.rfile.read(length) or b"{}")
+                body = json.loads(raw or b"{}")
                 if _REQUEST_LOG and body.get("priority") != "background":   # batch jobs are not client traffic
                     with open(_REQUEST_LOG, "a") as handle:
                         handle.write(json.dumps(body) + "\n")

@@ -174,7 +174,15 @@ CUDA engine yet.
    ```bash
    pip install git+https://github.com/ashhart/TensorFold.git
    tensorfold pull Vontra/Qwen3.8-27B-MLX-4bit z-lab/Qwen3.8-27B-DFlash2
-   tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --host 0.0.0.0 --port 8080
+   tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --port 8080
+   ```
+
+   This serves the Spark itself (127.0.0.1). To reach it from other machines, set an API key and name the
+   host clients use; TensorFold refuses to listen on other addresses without both:
+
+   ```bash
+   export TENSORFOLD_API_KEY=$(openssl rand -hex 32)   # clients send it as "Authorization: Bearer <key>"
+   tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --host 0.0.0.0 --port 8080 --allowed-host spark.lan
    ```
 
    The first start compiles the kernels (a minute or two); later starts reuse them while the container lives.
@@ -199,8 +207,11 @@ CUDA engine yet.
 
    ```bash
    tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --tp 2 --rank 1 --master 192.168.100.1
-   tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --tp 2 --rank 0 --master 192.168.100.1 --host 0.0.0.0
+   tensorfold serve Vontra/Qwen3.8-27B-MLX-4bit --tp 2 --rank 0 --master 192.168.100.1
    ```
+
+   For clients on other machines, add `--host 0.0.0.0 --allowed-host NAME` and `TENSORFOLD_API_KEY` on rank 0,
+   as in step 2.
 
    Rank 0 serves HTTP once both have loaded. The ranks refuse to start when they were given different settings
    (for example the draft model present on one Spark only).
