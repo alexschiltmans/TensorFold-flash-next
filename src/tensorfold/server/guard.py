@@ -7,7 +7,8 @@
   A web page that rebinds its own domain to 127.0.0.1 sends its domain as Host and is refused (403).
 - Origin: a request that carries an Origin header is refused (403) unless that origin is in ``allowed_origins``
   (empty by default). Clients outside a browser send no Origin and pass. No CORS headers are sent.
-- API key: when ``api_key`` is set, every route but ``GET /health`` (and ``/v1/health``) needs ``Authorization: Bearer <key>`` (401).
+- API key: when ``api_key`` is set, every route but ``GET /health`` (and ``/v1/health``) needs
+  ``Authorization: Bearer <key>`` (401); ``/health`` then answers ``{"status": "ok"}`` only.
   Without a key the Authorization header is ignored, so clients that send a placeholder key keep working.
 - Body: at most ``max_body_bytes`` (413); a body must come with a Content-Length (chunked bodies get 411).
 
@@ -23,6 +24,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import socket
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler
@@ -31,6 +33,7 @@ DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024
 LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
 HEALTH_ROUTES = frozenset({"/health", "/v1/health"})
 _DRAIN_TIMEOUT_S = 5.0
+_ASCII_DIGITS = re.compile(r"[0-9]+")   # str.isdigit() also passes digits such as "²" that int() rejects
 
 
 class BodyError(Exception):
@@ -153,7 +156,7 @@ def split_host_header(value: str) -> tuple[str, int | None] | None:
     if not name:
         return None
     if port_text:
-        if not port_text.isdigit() or not 0 < int(port_text) < 65536:
+        if not _ASCII_DIGITS.fullmatch(port_text) or not 0 < int(port_text) < 65536:
             return None
         return name, int(port_text)
     return name, None
@@ -247,6 +250,8 @@ class GuardedHandler(BaseHTTPRequestHandler):
 
     def _refusal(self) -> tuple[int, str, dict[str, str]] | None:
         port = int(self.server.server_address[1])
+        if len(self.headers.get_all("Host") or []) > 1:
+            return 400, "the request has more than one Host header", {}
         if not host_allowed(self.headers.get("Host"), port, self.policy):
             return 403, "this Host is not served here", {}
         if not origin_allowed(self.headers.get("Origin"), self.policy):
@@ -266,7 +271,7 @@ class GuardedHandler(BaseHTTPRequestHandler):
         values = self.headers.get_all("Content-Length") or []
         if not values:
             return 0
-        if len({v.strip() for v in values}) != 1 or not values[0].strip().isdigit():
+        if len({v.strip() for v in values}) != 1 or not _ASCII_DIGITS.fullmatch(values[0].strip()):
             raise BodyError(400, "the Content-Length header is not valid")
         length = int(values[0].strip())
         if length > self.policy.max_body_bytes:

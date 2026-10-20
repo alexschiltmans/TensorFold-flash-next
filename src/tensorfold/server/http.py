@@ -523,6 +523,9 @@ def make_handler(app: Any, policy: ServerPolicy | None = None) -> type[BaseHTTPR
 
         def handle_get(self) -> None:
             route = self._route()
+            if route == "/health" and self.policy.api_key:
+                self._send_json({"status": "ok"})     # answered without the key: no model details
+                return
             if route in {"", "/health"}:
                 self._send_json(
                     {

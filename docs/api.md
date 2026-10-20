@@ -37,6 +37,7 @@ Every request passes these before its route runs:
 
 | Check | Refused with |
 | --- | --- |
+| exactly one `Host` header | 400 |
 | `Host` must be `127.0.0.1`, `localhost` or `[::1]` with the server's port, or a `--allowed-host` entry | 403 |
 | an `Origin` header must be a `--allowed-origin` entry (none by default; clients outside a browser send no `Origin`) | 403 |
 | with `--api-key` (or `TENSORFOLD_API_KEY`) set: `Authorization: Bearer <key>` on every route but `GET /health` | 401 |
@@ -45,7 +46,10 @@ Every request passes these before its route runs:
 The Host check stops a web page that points its own domain at 127.0.0.1 (DNS rebinding) from reading replies;
 the Origin check refuses requests a browser sends on behalf of another site. A refused request's body is read and dropped, or the
 connection closed, so it is never taken as the next request. Without `--api-key`, an `Authorization` header is
-ignored, so clients configured with a placeholder key keep working.
+ignored, so clients configured with a placeholder key keep working. With a key set, `/health` answers
+`{"status": "ok"}` only.
+
+Request reads have no overall timeout, so the server is meant for loopback or a trusted network.
 
 A prompt longer than the server's context window gets HTTP 400 (`invalid_request_error`); in a stream, an
 `error` event.

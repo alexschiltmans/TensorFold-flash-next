@@ -345,3 +345,40 @@ def test_cuda_handler_applies_the_same_checks(serve) -> None:
                                 + http_request("GET", "/health", port, close=True)))
     assert got == [404, 200]
     assert len(app.bodies) == 1
+
+
+# -- malformed headers ------------------------------------------------------------------------------------------
+
+
+def test_non_ascii_digits_in_content_length_get_400(serve) -> None:
+    server, app = serve()
+    head = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{server.server_port}\r\n").encode()
+    raw = raw_exchange(server, head + "Content-Length: \u00b2\r\n\r\n".encode("latin-1"))
+    assert statuses(raw) == [400]
+    assert b"Connection: close" in raw
+    assert app.messages is None
+
+
+def test_non_ascii_digits_in_host_port_are_refused(serve) -> None:
+    server, _ = serve()
+    raw = raw_exchange(server, b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:80\xb2\r\nConnection: close\r\n\r\n")
+    assert statuses(raw) == [403]
+
+
+def test_more_than_one_host_header_gets_400(serve) -> None:
+    server, _ = serve()
+    port = server.server_port
+    raw = raw_exchange(server, (f"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nHost: evil.example\r\n"
+                                "Connection: close\r\n\r\n").encode())
+    assert statuses(raw) == [400]
+
+
+def test_health_shows_no_model_details_when_a_key_is_set(serve) -> None:
+    server, _ = serve(ServerPolicy.build(api_key="k", environ={}))
+    status, body, _ = request(server, "GET", "/health")
+    assert status == 200
+    assert json.loads(body) == {"status": "ok"}
+    status, body, _ = request(server, "GET", "/", headers={"Authorization": "Bearer k"})
+    assert status == 200 and json.loads(body)["model"] == "fake-model"
+    open_server, _ = serve()
+    assert json.loads(request(open_server, "GET", "/health")[1])["model"] == "fake-model"
