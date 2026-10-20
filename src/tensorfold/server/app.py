@@ -1055,6 +1055,11 @@ class ChatApp:
         snapshot_dir: Path | None = None,
         model_id: str = "",
     ) -> None:
+        # Streamed experts (TF_EXPERT_STREAM=1) serve one sequence at a time: every forward runs on the scheduler's
+        # one engine thread, and one lane keeps a second request (a client's title request, say) waiting for the
+        # round boundary instead of interleaving its forward with the running one.
+        if int(lanes) > 1 and getattr(model, "__dict__", {}).get("expert_stream") is not None:
+            raise ValueError(f"lanes={lanes}: a model with streamed experts (TF_EXPERT_STREAM=1) serves one lane")
         # three candidate entries per conversation (history boundary, stable prefix, reply end)
         if checkpoint_slots is None:
             checkpoint_slots = max(3 * int(lanes), 8)

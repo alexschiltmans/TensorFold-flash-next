@@ -23,6 +23,10 @@ routers, hyper-connections, PLE, embeddings, head) and takes every layer's route
 
 The checkpoint's expert arrays are dropped from ``mx.load``'s lazy dict before anything evaluates them, so they are
 never read. Nothing here wires memory: no ``mx.set_wired_limit`` and none of kquant's arena or residency calls.
+
+With TF_EXPERT_STREAM=1 (``use_stream``, expert_stream.py) the file is not mapped for the GPU at all: the modules
+hold C_L slots each (a resident layer, TF_EXPERT_RESIDENT, all E_L), their arrays are the stream's arenas (kquant
+arena buffers), and the Q2_0 repack happens per expert as it is read.
 """
 
 from __future__ import annotations
@@ -203,6 +207,20 @@ class GGUFExperts:
                 self.plan[(layer, proj)] = t
         self.num_experts, self.hidden, self.intermediate = num_experts, hidden, intermediate
         self.counts = list(counts) if counts is not None else None
+        self.stream: Any = None
+
+    def use_stream(self, cfg: dict[str, Any]) -> Any:
+        """Stream the experts (expert_stream.settings()); call before ``install``. Returns the ExpertStream."""
+
+        from tensorfold.families.qwen4_exp.expert_stream import ExpertStream
+
+        self.stream = ExpertStream(self, cfg)
+        return self.stream
+
+    def stored(self, layer: int) -> int:
+        """The expert count of layer ``layer``'s stacks in the file (E_L)."""
+
+        return int(self.plan[(layer, "gate_proj")].dims[2])
 
     def codec(self, layer: int, proj: str) -> str | None:
         return _TYPES[self.plan[(layer, proj)].ggml_type][1]
@@ -211,8 +229,12 @@ class GGUFExperts:
         kinds: dict[str, int] = {}
         for t in self.plan.values():
             kinds[_TYPES[t.ggml_type][0]] = kinds.get(_TYPES[t.ggml_type][0], 0) + 1
-        return {"file": str(self.path), "tensors": kinds, "zero_copy_bytes": self.file_bytes(),
-                "repacked_bytes": self.repacked_bytes()}
+        out = {"file": str(self.path), "tensors": kinds, "zero_copy_bytes": self.file_bytes(),
+               "repacked_bytes": self.repacked_bytes()}
+        if self.stream is not None:
+            out.update(zero_copy_bytes=0, repacked_bytes=0, stream_slots=self.stream.slots,
+                       arena_bytes=self.stream.arena_bytes, ring_bytes=self.stream.ring.nbytes)
+        return out
 
     def _nbytes(self, t: _Tensor) -> int:
         _, _, wpb, bpb = _TYPES[t.ggml_type]
@@ -234,8 +256,11 @@ class GGUFExperts:
         return total
 
     def ranges(self) -> list[tuple[str, int, int]]:
-        """(name, file offset, bytes) of every expert stack used in place: what a residency probe maps."""
+        """(name, file offset, bytes) of every expert stack used in place: what a residency probe maps (none when
+        streaming)."""
 
+        if self.stream is not None:
+            return []
         return [(t.name, t.offset, self._nbytes(t)) for t in self.plan.values() if _TYPES[t.ggml_type][1]]
 
     def install(self, model: nn.Module) -> None:
@@ -252,6 +277,8 @@ class GGUFExperts:
                 experts, out_dims, in_dims = old.weight.shape
                 if self.counts is not None:
                     experts = self.counts[layer_index]          # a cut file's stack (load_weights checks shapes)
+                if self.stream is not None:
+                    experts = self.stream.arenas[self.stream.index[layer_index]].C     # the arena's slots
                 codec = self.codec(layer_index, proj)
                 made[proj] = (KQuantSwitchLinear(experts, out_dims, in_dims, False, codec) if codec
                               else AffineQ2SwitchLinear(experts, out_dims, in_dims))
@@ -263,6 +290,9 @@ class GGUFExperts:
         Raises if a stack meant to be used in place came back as a copy (``require_zero_copy``, the default): a
         copy would be anonymous memory, which is what this route exists to avoid."""
 
+        if self.stream is not None:
+            # the arenas: the file is never mapped for the GPU, so the zero-copy count check has nothing to count
+            return self.stream.module_arrays()
         import mlx_kquant as kq
 
         wanted = {t.name: key for key, t in self.plan.items() if _TYPES[t.ggml_type][1]}

@@ -741,7 +741,14 @@ class SparseMoE(nn.Module):
                                                                                           experts)).item()):
                 raise RuntimeError("experts_cut: a routed expert is outside the cut (TF_EXPERT_CUT_CHECK)")
             experts = mx.take(inv, experts)
-        routed = (self.switch_mlp(x, experts) * weights[..., None]).sum(axis=-2)
+        stream = self.__dict__.get("expert_stream")
+        if stream is None:
+            routed = (self.switch_mlp(x, experts) * weights[..., None]).sum(axis=-2)
+        else:
+            # TF_EXPERT_STREAM (expert_stream.py): the routed experts made resident first, then the stock switch over
+            # the arena (or the prefill ring); the output is the fence for the next slot or ring write
+            routed = (stream(self, x, experts) * weights[..., None]).sum(axis=-2)
+            stream.done(routed)
         shared = self.shared_expert(x) * mx.sigmoid(self.shared_expert_gate(x))
         return routed + shared
 
@@ -804,7 +811,10 @@ def set_expert_cut(model: Any, keep_local: dict[str, Any]) -> list[int]:
         if (ids.size < moe.top_k or ids.min() < 0 or ids.max() >= size or not bool(np.all(np.diff(ids) > 0))):
             raise ValueError(f"experts_cut layer {i}: ids must be ascending, unique, within 0..{size - 1}, at least "
                              "top-k of them")
-        stored = int(moe.switch_mlp.gate_proj["weight"].shape[0])
+        gx = model.__dict__.get("gguf_experts")
+        # streamed experts: the modules hold the arena's slots, the file holds the cut's stack
+        stored = (gx.stored(i) if gx is not None and gx.stream is not None
+                  else int(moe.switch_mlp.gate_proj["weight"].shape[0]))
         if stored != ids.size:
             raise ValueError(f"experts_cut layer {i}: {ids.size} kept ids, but the expert stacks hold {stored}")
         cut = np.zeros(size, dtype=bool)
@@ -1164,11 +1174,37 @@ def norms_stored_around_one(weights: dict[str, mx.array]) -> bool:
     return around_one
 
 
+def _trunk_embd_rows(config: dict[str, Any]) -> bool:
+    """TF_TRUNK_EMBD_ROWS (gguf_embd.py), validated against what reads the embedding other than by lookup."""
+
+    value = os.environ.get("TF_TRUNK_EMBD_ROWS", "").strip()
+    if value in ("", "0"):
+        return False
+    if value != "1":
+        raise ValueError(f"TF_TRUNK_EMBD_ROWS={value!r}: 1 or 0")
+    if not config.get("trunk_source"):
+        raise ValueError("TF_TRUNK_EMBD_ROWS=1 needs trunk_source (token_embd read from the trunk GGUF)")
+    text = config.get("text_config", config)
+    if text.get("tie_word_embeddings") or config.get("tie_word_embeddings"):
+        raise ValueError("TF_TRUNK_EMBD_ROWS=1 with tied embeddings: the head reads the table as a matrix")
+    draft = os.environ.get("TF_FLASH_REF_DRAFT", "off").strip().lower() or "off"
+    if draft != "off" or os.environ.get("TF_FLASH_MTP_GGUF", "").strip():
+        raise ValueError("TF_TRUNK_EMBD_ROWS=1 with drafting (TF_FLASH_REF_DRAFT / TF_FLASH_MTP_GGUF): the MTP "
+                         "head's fused prologue reads the table through its own kernel")
+    return True
+
+
 def load(model_dir: Path, *, lazy: bool = False) -> tuple[Qwen4Exp, Any]:
     from mlx_lm.utils import load_tokenizer
 
     config = json.loads((Path(model_dir) / "config.json").read_text())
     cfg = Config.from_dict(config)
+    from tensorfold.families.qwen4_exp import expert_stream
+
+    stream_cfg = expert_stream.settings()
+    if stream_cfg is not None:
+        expert_stream.refuse(stream_cfg, config)
+    embd_rows = _trunk_embd_rows(config)
     model = Qwen4Exp(cfg)
     weights: dict[str, mx.array] = {}
     for path in sorted(Path(model_dir).glob("model*.safetensors")):
@@ -1206,6 +1242,8 @@ def load(model_dir: Path, *, lazy: bool = False) -> tuple[Qwen4Exp, Any]:
                                    counts=None if cut_keep is None else
                                    [len(cut_keep[i]) for i in range(cfg.num_hidden_layers)])
         weights = {k: v for k, v in weights.items() if not is_expert_key(k)}
+        if stream_cfg is not None:
+            gguf_experts.use_stream(stream_cfg)
         gguf_experts.install(model)
 
     def quantized(path: str, module: nn.Module) -> bool | dict[str, Any]:
@@ -1226,7 +1264,7 @@ def load(model_dir: Path, *, lazy: bool = False) -> tuple[Qwen4Exp, Any]:
         # leave the lazy dict unread, as the experts' do
         from tensorfold.families.qwen4_exp.gguf_trunk import GGUFTrunk
 
-        gguf_trunk = GGUFTrunk(Path(model_dir), trunk, cfg)
+        gguf_trunk = GGUFTrunk(Path(model_dir), trunk, cfg, embd_rows=embd_rows)
         weights = {k: v for k, v in weights.items() if not gguf_trunk.replaces(k)}
         gguf_trunk.install(model)
 
@@ -1234,10 +1272,15 @@ def load(model_dir: Path, *, lazy: bool = False) -> tuple[Qwen4Exp, Any]:
     if gguf_experts is not None:
         weights.update(gguf_experts.arrays())
         model.__dict__["gguf_experts"] = gguf_experts          # kept out of the module tree, as ``fused``
+        if gguf_experts.stream is not None:
+            model.__dict__["expert_stream"] = gguf_experts.stream
     if gguf_trunk is not None:
         trunk_arrays, gguf_trunk.report = gguf_trunk.arrays()
         weights.update(trunk_arrays)
         model.__dict__["gguf_trunk"] = gguf_trunk
+        if embd_rows:
+            print(f"tensorfold: token_embd as CPU row reads ({model.model.embed_tokens.nbytes / 2**20:.0f} MiB, not "
+                  "wrapped for the GPU)", flush=True)
     if norms_stored_around_one(weights):
         # early MLX conversions store these norms' gamma itself (around 1), not gamma - 1
         for path, module in model.named_modules():
@@ -1283,6 +1326,16 @@ def load(model_dir: Path, *, lazy: bool = False) -> tuple[Qwen4Exp, Any]:
     if keep_path:
         n = set_expert_keep(model, json.loads(Path(keep_path).expanduser().read_text()))
         print(f"tensorfold: TF_EXPERT_KEEP={keep_path}: router mask on {n} layers", flush=True)
+    if embd_rows and model.__dict__.get("fused") is not None:
+        raise ValueError("TF_TRUNK_EMBD_ROWS=1 needs the reference forward: the fused decode reads the table itself")
+    stream = model.__dict__.get("expert_stream")
+    if stream is not None:
+        if model.__dict__.get("fused") is not None:
+            raise ValueError("TF_EXPERT_STREAM=1 needs the reference forward: the fused decode routes itself")
+        stream.check_views(model)                       # the modules' buffers are the arenas (no MLX copy)
+        for i, layer in enumerate(model.layers):
+            layer.mlp.__dict__["expert_stream"] = stream.layer(i)
+        print(stream.summary(), flush=True)
     # the sparse prefill settings this process starts with (read again at every call), so a log shows the arm
     print(sparse_prefill.describe(), flush=True)
     eos = config.get("eos_token_id")

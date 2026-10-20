@@ -19,6 +19,9 @@ A checkpoint whose config.json names a ``trunk_source`` takes every non-expert w
   V channels, and the columns of out_proj, are permuted. A column permutation of a K-quant matrix cannot be undone
   on its bytes, so the layer runs in the GGUF's order instead: ``GatedDeltaNet.v_tiled`` repeats q and k by tiling
   (the same math, an exact reindexing of heads). The recurrent state is then in tiled head order too.
+- TF_TRUNK_EMBD_ROWS=1 (``embd_rows``): ``token_embd`` becomes ``gguf_embd.GGUFEmbedRows``, CPU row reads from a
+  numpy memmap of the same bytes (bit-identical lookups); it is skipped in ``kq.load_gguf``, so it is never wrapped
+  for the GPU and not counted in the zero-copy views.
 - ``fallback``: regexes of TensorFold parameter paths to keep from the checkpoint (a DeltaNet layer is all or none).
 
 Nothing here wires memory. The numpy-only parts (``trunk_plan``, the transforms) import no MLX, so a CPU check can
@@ -167,7 +170,7 @@ def is_bf16_exact(a: np.ndarray) -> bool:
 class GGUFTrunk:
     """Plan, module swaps and arrays for one model's trunk from a GGUF file."""
 
-    def __init__(self, model_dir: Path, source: dict[str, Any], cfg: Any) -> None:
+    def __init__(self, model_dir: Path, source: dict[str, Any], cfg: Any, embd_rows: bool = False) -> None:
         from tensorfold.families.qwen4_exp.gguf_experts import read_gguf_tensors
 
         if source.get("format") != FORMAT:
@@ -191,6 +194,11 @@ class GGUFTrunk:
                 if t.ggml_type not in GGML_TYPES:
                     raise ValueError(f"{name}: ggml type {t.ggml_type} is not handled here")
         self.cfg = cfg
+        self.embd_rows = bool(embd_rows)
+        if self.embd_rows:
+            mine = [e for e in self.plan if e.gguf[0] == "token_embd.weight"]
+            if not mine or self.codec(mine[0]) is None:
+                raise ValueError("TF_TRUNK_EMBD_ROWS=1 needs token_embd from the trunk GGUF in a kquant codec")
         # DeltaNet layers in the GGUF's (tiled) value-head order: all of their tensors must come from the GGUF
         self.tiled_layers: list[int] = []
         for i, kind in enumerate(cfg.layer_types):
@@ -225,7 +233,7 @@ class GGUFTrunk:
                 kind = GGML_TYPES[self.tensors[name].ggml_type][0]
                 kinds[kind] = kinds.get(kind, 0) + 1
         report = self.__dict__.get("report") or {}
-        return {"file": str(self.path), "entries": len(self.plan), "tensor_types": kinds, "fallback": self.fallback,
+        return {"embd_rows": self.embd_rows, "file": str(self.path), "entries": len(self.plan), "tensor_types": kinds, "fallback": self.fallback,
                 "tiled_deltanet_layers": len(self.tiled_layers),
                 "zero_copy_entries": len(report.get("zero_copy", [])), "zero_copy_bytes": report.get("zero_copy_bytes"),
                 "transcoded_entries": len(report.get("transcoded", {})),
@@ -245,7 +253,12 @@ class GGUFTrunk:
             parent_path, attr = owner_path.rsplit(".", 1) if "." in owner_path else ("", owner_path)
             parent = _resolve(model, parent_path)
             old = getattr(parent, attr)
-            if e.gguf[0] == "token_embd.weight":
+            if e.gguf[0] == "token_embd.weight" and self.embd_rows:
+                from tensorfold.families.qwen4_exp.gguf_embd import GGUFEmbedRows
+
+                rows, dims = old.weight.shape
+                new = GGUFEmbedRows(self.path, self.tensors[e.gguf[0]].offset, rows, dims, codec)
+            elif e.gguf[0] == "token_embd.weight":
                 rows, dims = old.weight.shape
                 new = KQuantEmbedding(rows, dims, codec)
             else:
@@ -262,7 +275,9 @@ class GGUFTrunk:
         import mlx.core as mx
         import mlx_kquant as kq
 
-        names = sorted({n for e in self.plan for n in e.gguf})
+        # TF_TRUNK_EMBD_ROWS: token_embd is read by GGUFEmbedRows, not loaded (and not wrapped for the GPU)
+        plan = [e for e in self.plan if not (self.embd_rows and e.gguf[0] == "token_embd.weight")]
+        names = sorted({n for e in plan for n in e.gguf})
         wanted = set(names)
         before = kq.zero_copy_view_count()
         arrays, codecs, _meta, _shapes = kq.load_gguf(str(self.path), zero_copy=True,
@@ -274,7 +289,8 @@ class GGUFTrunk:
                                "(trunk_source.require_zero_copy)")
         out: dict[str, Any] = {}
         report: dict[str, Any] = {"zero_copy": [], "transcoded": {}, "views": views,
-                                  "zero_copy_bytes": 0, "transcoded_bytes": 0}
+                                  "zero_copy_bytes": 0, "transcoded_bytes": 0,
+                                  "cpu_rows": [e.tf for e in self.plan if e not in plan]}
 
         def note_zero_copy(e: Entry) -> None:
             report["zero_copy"].append(e.tf)
@@ -284,7 +300,7 @@ class GGUFTrunk:
             report["transcoded"][e.tf] = how
             report["transcoded_bytes"] += int(value.nbytes)
 
-        for e in self.plan:
+        for e in plan:
             src = [arrays[n] for n in e.gguf]
             codec = self.codec(e)
             if codec is not None:
