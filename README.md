@@ -10,8 +10,12 @@ with 768 of its 12,288 routed experts removed, on 48 GB Apple Silicon Macs. It a
 - lower transient memory, sparse prefill attention and extra prompt-cache checkpoints for long prompts;
 - prompt-cache entries and checkpoints that share the pages holding a common prefix's sparse-attention KV (off by
   default; [docs/kv-pages.md](docs/kv-pages.md));
-- a server that stops generating for disconnected clients and does not preempt a background request, such as a
-  session title, once it has produced a token.
+- optional SSD streaming of routed experts, disabled by default: each layer keeps a fixed number of expert slots in
+  memory and loads the other experts from the expert GGUF as tokens route to them; one sequence at a time, no
+  drafting ([docs/expert-streaming.md](docs/expert-streaming.md));
+- a server that stops generating for disconnected clients, does not preempt a background request, such as a
+  session title, once it has produced a token, and answers only local requests unless given an allowed host and an
+  API key ([docs/api.md](docs/api.md#access-checks)).
 
 Most model-side additions are off by default; the Hugging Face setup below turns on the ones it uses. Details:
 [docs/flash-next-gguf.md](docs/flash-next-gguf.md).
@@ -27,7 +31,15 @@ cd Flash-Next-Coder-cut240
 ./install.sh && ./setup.sh && ./serve.sh
 ```
 
-Everything else is upstream TensorFold, whose README follows unchanged.
+This fork builds on TensorFold 0.3.4 (upstream commit
+[`2f8e514`](https://github.com/ashhart/TensorFold/commit/2f8e514b0b7d615df7c971627ce3c0fb7e55d93a), MIT). Upstream
+later replaced its Python engine with a native one, so this fork carries the Python engine for the formats this model
+needs. Upstream's Python engine already streamed MLX 4-bit experts from the SSD (`--ssd-experts`, upstream commit
+[`85653c7`](https://github.com/ashhart/TensorFold/commit/85653c77166552722368e0f2466ee8571a8586d9)); this fork's
+streaming reads this model's expert GGUF, with the bytes as stored in the file.
+
+Everything else is upstream TensorFold 0.3.4, whose README follows, with its `serve` commands and server options
+updated for this fork's access checks.
 
 ---
 
