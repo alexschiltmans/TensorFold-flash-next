@@ -566,19 +566,21 @@ class CheckpointStore:
             self._entries = entries
 
     def evict_lru(self) -> bool:
-        """Drop the least recently used entry, conversations before divergence anchors before pinned system blocks,
-        for a model whose entries hold pages of a pool with no free page left (``attach_prompt_cache``). The entry
-        last used goes too when nothing else is left; pinned system blocks never do (the copy that needs the page is
-        made contiguous instead). False when no unpinned entry is left."""
+        """Drop the least recently used entry that holds pages, conversations before divergence anchors, for a model
+        whose entries hold pages of a pool with no free page left (``attach_prompt_cache``). The entry last used goes
+        too when nothing else is left; pinned system blocks never do, and entries without pages (contiguous copies)
+        stay, since dropping them frees no page (the copy that needs the page is made contiguous instead). False when
+        no unpinned entry holds pages."""
 
         import gc
 
+        def holds_pages(entry: CheckpointEntry) -> bool:
+            return any(callable(getattr(item, "page_refs", None)) and item.page_refs() for item in entry.cache)
+
         with self._lock:
             entries = self._entries
-            if not entries:
-                return False
-            order = ([i for i, e in enumerate(entries) if not e.pinned and not e.anchor]
-                     or [i for i, e in enumerate(entries) if not e.pinned])
+            paged = [i for i, e in enumerate(entries) if not e.pinned and holds_pages(e)]
+            order = [i for i in paged if not entries[i].anchor] or paged
             if not order:
                 return False
             dropped = entries.pop(order[-1])

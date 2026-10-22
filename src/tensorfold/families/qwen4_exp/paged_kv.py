@@ -151,7 +151,7 @@ class KVPool:
 
 
 _POOLS: dict[int, KVPool] = {}
-# evict() -> bool: the server's prompt cache drops its least recently used entry (False: it has none);
+# evict() -> bool: the server's prompt cache drops its least recently used entry that holds pages (False: none does);
 # context: the window new pools are sized for
 _STATE: dict[str, Any] = {"evict": None, "context": DEFAULT_CONTEXT}
 
@@ -389,8 +389,8 @@ class HybridAttentionCache(AttentionCache):
         PagedAttentionCache that references the source pages and holds new pages for the positions after them. The new
         pages are written from evaluated temporaries: a lazy write whose source is a view of these buffers would keep
         them referenced, and MLX would copy them whole at their next write. The entry's full pages then become this
-        cache's source, so its next stored copy writes only what follows. Evaluated here. With no page to be had, a
-        contiguous copy."""
+        cache's source, so its next stored copy writes only what follows. Evaluated here. With no page to be had, or
+        more new pages than the pool holds, a contiguous copy."""
 
         n = self.offset
         entry = PagedAttentionCache(self.layer)
@@ -405,6 +405,12 @@ class HybridAttentionCache(AttentionCache):
                 raise RuntimeError("TF_KV_PAGED stores batch-1 caches only")
             p.shape = (int(self.keys.shape[1]), int(self.keys.shape[3]), self.keys.dtype)
         shared = min(self.src_len, n) // PAGE
+        # more new pages than the pool can ever hold next to this cache's source pages: contiguous at once, so no
+        # prompt-cache entry is evicted for a copy that cannot fit
+        if -(-(n - shared * PAGE) // PAGE) > p.pages - len(set(self.src_pages)):
+            print(f"[tensorfold] TF_KV_PAGED: {n} positions do not fit the {p.pages}-page pool of layer "
+                  f"{self.layer}; this copy is contiguous", flush=True)
+            return self._plain_copy()
         for page in self.src_pages[:shared]:
             p.ref(page)
             entry.pages.append(page)

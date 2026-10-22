@@ -484,6 +484,53 @@ def test_checkpoint_store_longest_does_not_count_a_hit() -> None:
     assert store.hits == 0 and store.misses == 0
 
 
+def test_checkpoint_store_evicts_only_entries_that_hold_pages() -> None:
+    """A full KV page pool evicts only entries that hold pages: a contiguous copy frees none, so it stays, and with
+    no paged entry left evict_lru returns False (the copy is then made contiguous) instead of emptying the cache."""
+
+    from tensorfold.server.app import CheckpointEntry
+
+    class Paged:
+        def page_refs(self) -> list[tuple[int, int]]:
+            return [(0, 1)]
+
+    class Plain:
+        pass
+
+    class Emptied:
+        def page_refs(self) -> list[tuple[int, int]]:
+            return []
+
+    def entry(n: int, item: Any, **flags: bool) -> CheckpointEntry:
+        return CheckpointEntry(list(range(n)), [item], list(range(n + 1)), **flags)
+
+    store = CheckpointStore(8, copier=lambda c: c)
+    store._entries = [entry(30, Paged()), entry(20, Plain())]     # most recently used first
+    assert store.evict_lru()
+    assert [len(e.tokens) for e in store._entries] == [20] and store.evictions == 1
+    assert not store.evict_lru()                                  # only a contiguous entry left: it stays
+    assert len(store) == 1 and store.evictions == 1
+
+    store = CheckpointStore(8, copier=lambda c: c)
+    store._entries = [entry(40, Paged(), pinned=True), entry(30, Plain()), entry(20, Plain())]
+    assert not store.evict_lru()                                  # a pinned system block never goes
+    assert len(store) == 3 and store.evictions == 0
+
+    store = CheckpointStore(8, copier=lambda c: c)
+    store._entries = [entry(30, Paged()), entry(20, Paged(), anchor=True), entry(10, Plain())]
+    assert store.evict_lru()                                      # conversations before anchors
+    assert [len(e.tokens) for e in store._entries] == [20, 10]
+    assert store.evict_lru()
+    assert [len(e.tokens) for e in store._entries] == [10] and not store.evict_lru()
+
+    store = CheckpointStore(8, copier=lambda c: c)
+    mixed = CheckpointEntry(list(range(30)), [Plain(), Paged()], list(range(31)))   # one paged layer is enough
+    store._entries = [mixed, entry(20, Emptied()), entry(10, Plain())]              # no pages left: not counted
+    assert store.evict_lru()
+    assert [len(e.tokens) for e in store._entries] == [20, 10]
+    assert not store.evict_lru() and len(store) == 2 and store.evictions == 1
+
+
 def test_scheduler_reads_a_stored_block_the_store_lacks(tmp_path) -> None:
     mx = pytest.importorskip("mlx.core")
     from mlx_lm.models.cache import KVCache

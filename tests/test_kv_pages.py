@@ -250,15 +250,17 @@ def test_prompt_cache_store_evicts_for_pages() -> None:
         del other
         gc.collect()
         assert store.evictions - evictions == 2 and len(store) == 1 and pool.used() == 30
-        # 70 pages do not fit a 64-page pool: the copy is contiguous, every page taken for it is given back
+        # 70 pages do not fit a 64-page pool: the copy is contiguous at once, and the paged entry is not evicted for it
         big, bigref = q4.attention_cache(0), q4.AttentionCache()
         for _ in range(10):
             step(rng, big, bigref, 1792)
+        evictions = store.evictions
         store.insert(list(range(2, 17922)), [big], last_prompt=[])
         del big
         gc.collect()
         plain = store._entries[0].cache[0]
-        assert type(plain) is q4.AttentionCache and pool.used() == 0
+        assert type(plain) is q4.AttentionCache and len(store) == 2 and store.evictions == evictions
+        assert pool.used() == 30
         assert same(plain.keys[:, :, :plain.offset], bigref.keys[:, :, :bigref.offset])
         # a request resumed from a contiguous entry is paged again from its next stored copy
         small, smallref = q4.AttentionCache(), q4.AttentionCache()
@@ -267,6 +269,70 @@ def test_prompt_cache_store_evicts_for_pages() -> None:
         assert type(state) is q4.LinearCache and type(adopted) is P.HybridAttentionCache and adopted.layer == 1
         assert adopted.keys is small.keys
         assert entry_matches(adopted.store_copy(), *snap(smallref))
+
+
+def test_prompt_cache_keeps_entries_too_big_for_the_pool() -> None:
+    """A pool smaller than one prompt: each stored copy is contiguous and no entry is evicted for pages, so the prompt
+    cache keeps both entries and a later request resumes from one."""
+
+    from tensorfold.engine.lane_engine import LaneEngine
+    from tensorfold.server.app import CheckpointStore
+
+    with env(TF_KV_POOL_PAGES="32", **PAGED):
+        rng = np.random.default_rng(16)
+        store = CheckpointStore(8, copier=LaneEngine.copy_single_cache)
+        P.attach(store.evict_lru, 0)
+        refs = {}
+        for first in (0, 1):
+            live, ref = q4.attention_cache(0), q4.AttentionCache()
+            refs[first] = ref
+            for _ in range(5):
+                step(rng, live, ref, 2048)                      # 10,240 positions: 40 pages, more than the pool
+            store.insert(list(range(first, first + 10240)), [live], last_prompt=[])
+            del live
+            gc.collect()
+        assert len(store) == 2 and store.evictions == 0
+        assert all(type(e.cache[0]) is q4.AttentionCache for e in store._entries)
+        assert P.pool(0).used() == 0
+        hit = store.match(list(range(10300)))
+        assert hit is not None and hit[0] == 10240 and hit[1][0].offset == 10240
+        assert same(hit[1][0].keys[:, :, :10240], refs[0].keys[:, :, :10240])
+        assert same(hit[1][0].values[:, :, :10240], refs[0].values[:, :, :10240])
+
+
+def test_full_pool_gives_back_a_partial_copy() -> None:
+    """A copy that fits the pool but finds it full of a pinned entry's pages: evict_lru has nothing to evict, the pages
+    the copy took are given back, the copy is contiguous, and the pinned entry keeps its pages."""
+
+    from tensorfold.engine.lane_engine import LaneEngine
+    from tensorfold.server.app import CheckpointStore
+
+    with env(TF_KV_POOL_PAGES="64", **PAGED):
+        rng = np.random.default_rng(17)
+        store = CheckpointStore(8, copier=LaneEngine.copy_single_cache)
+        P.attach(store.evict_lru, 0)
+        live, ref = q4.attention_cache(0), q4.AttentionCache()
+        for _ in range(5):
+            step(rng, live, ref, 2048)                          # 10,240 positions: 40 pages
+        store.insert(list(range(10240)), [live], last_prompt=[], pinned=True)
+        del live
+        gc.collect()
+        pinned = store._entries[0].cache[0]
+        assert type(pinned) is P.PagedAttentionCache and len(pinned.pages) == 40
+        pool = pinned.pool
+        assert pool.used() == 40
+        other, scratch = q4.attention_cache(0), q4.AttentionCache()
+        for _ in range(4):
+            step(rng, other, scratch, 1920)                     # 30 pages: fits 64, but only 24 are free
+        evictions = store.evictions
+        store.insert(list(range(1, 7681)), [other], last_prompt=[])
+        del other
+        gc.collect()
+        plain = store._entries[0].cache[0]
+        assert type(plain) is q4.AttentionCache and plain.offset == 7680
+        assert len(store) == 2 and store.evictions == evictions and pool.used() == 40
+        assert store._entries[1].cache[0] is pinned and pinned.pages and len(pinned.pages) == 40
+        assert same(plain.keys[:, :, :7680], scratch.keys[:, :, :7680])
 
 
 def test_disk_snapshot_of_a_paged_entry() -> None:
