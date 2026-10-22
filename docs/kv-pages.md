@@ -21,9 +21,10 @@ With the flag:
   keys only to pool blocks it has not pooled yet, so a resumed request holds zeros below that point and does not read
   them. A rollback that would reach below that point fails with an error instead of reading the zeros; drafting
   rolls back a few positions at a time.
-- When a pool has no free page, the server evicts prompt-cache entries, least recently used first: conversations,
-  then divergence anchors. Pinned system blocks are never evicted for pages. When no other entry is left, the copy
-  that needs the page is made contiguous, as without the flag.
+- When a pool has no free page, the server evicts prompt-cache entries that hold pages, least recently used first:
+  conversations, then divergence anchors. Pinned system blocks and contiguous entries are not evicted for pages. A
+  copy that cannot fit the pool is stored contiguous at once, as without the flag, and a copy that finds no
+  page-holding entry left to evict is stored contiguous too.
 - `--prompt-cache-gib` counts each page once, however many entries share it.
 - Disk snapshots (`--snapshot-dir`) are written as contiguous caches that hold no page references, so a snapshot is
   self-contained. A request resumed from one is paged again from its next stored copy.
@@ -91,6 +92,6 @@ A reply counts as identical when its token ids match those of the same greedy re
 The wired sample includes macOS's own ~2.4 GB; at 64K it sits about 1.4 GB below 38.65 GB, the line at which the runs'
 memory guard stops a session: close other apps before a 64K session. With the 64-page pool the three differing
 replies resumed from another cached entry after evictions; without the flag, which entry a request resumes from can
-change its tokens too. A pool smaller than one prompt (`TF_KV_POOL_PAGES=32` at this prompt length) empties the prompt
-cache, so every request starts from an empty cache; keep the default pool (one window of pages plus 32). Every run is listed in
-`evidence/window-64k.md` of the model repository.
+change its tokens too. With a pool smaller than one prompt (`TF_KV_POOL_PAGES=32` at this prompt length), copies that
+do not fit the pool are stored contiguous and save no page memory; the prompt cache keeps working. Keep the default
+pool (one window of pages plus 32). Every run is listed in `evidence/window-64k.md` of the model repository.
