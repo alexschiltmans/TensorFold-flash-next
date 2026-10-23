@@ -384,6 +384,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from http.server import ThreadingHTTPServer
 
     from tensorfold import families, hub
+    from tensorfold.server import logsink
 
     policy = _server_policy(args)
 
@@ -411,15 +412,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
     model_dir = hub.resolve(args.model, required_files=required_files)
     if needs_full_snapshot and check is not None:
         check(model_dir)                         # checks that need the complete index, such as an MTP head
+    # from here on a closed or unread stdout/stderr (a server started from a shell that has since exited) must not
+    # fail requests: refusals above still print straight to the terminal
+    logsink.install()
     if backend == "cuda":
         return _serve_cuda(args, family, model_dir, policy)
     for key, value in getattr(family.package, "MLX_ENV", {}).items():
         os.environ.setdefault(key, value)       # before MLX starts: it reads them once
 
     # `kill -USR1 <pid>` prints every thread's Python stack: the way to see where a silent server waits
-    import faulthandler
-
-    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    logsink.register_stack_dump(signal.SIGUSR1)
     import mlx.core as mx
 
     # MLX keeps freed buffers up to its memory limit: long contexts, whose attention buffers change size every

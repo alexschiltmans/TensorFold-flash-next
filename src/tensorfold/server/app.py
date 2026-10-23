@@ -724,8 +724,7 @@ class Scheduler:
         """Print the queue and every thread's stack once if requests wait while nothing moves (a stall is
         otherwise invisible). ``kill -USR1 <pid>`` dumps the same stacks on demand."""
 
-        import faulthandler
-        import sys
+        from tensorfold.server.logsink import dump_stacks
 
         mark: tuple[int, int, int] | None = None
         since = time.perf_counter()
@@ -740,10 +739,10 @@ class Scheduler:
             limit = self.stall_prefill_s if self._starting is not None else self.stall_s
             if now - since > limit and not dumped:
                 dumped = True
-                print(f"[tensorfold] stalled {now - since:.0f}s: queued={self._queue.qsize()} "
-                      f"held={self._held is not None} jobs={len(self._jobs)} active={self.engine.active_count} "
-                      f"starting={self._starting is not None}; every thread's stack follows", flush=True)
-                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+                dump_stacks(f"[tensorfold] stalled {now - since:.0f}s: queued={self._queue.qsize()} "
+                            f"held={self._held is not None} jobs={len(self._jobs)} "
+                            f"active={self.engine.active_count} starting={self._starting is not None}; "
+                            "every thread's stack follows")
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
