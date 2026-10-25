@@ -58,6 +58,7 @@ TF_EXPERT_LAYER_SLOTS (resident layers and per-layer slots, above; with TF_EXPER
 both sets the equal C of the other layers); TF_EXPERT_PREFILL_ROWS (2048: a ring call with fewer rows is a prompt's final chunk, unless the caller says so with
 ``ExpertStream.final_chunk``); TF_EXPERT_MINCORE=1 (label each read cold or cached by ``mincore`` on a separate
 read-only mapping, never mapped for the GPU); TF_EXPERT_STATS=path.jsonl (one line per call; without it only the last CALLS_KEPT calls are kept in memory);
+TF_EXPERT_TRACE=path.rtr (binary router trace, one record per streamed-layer call; refuses an existing file);
 TF_EXPERT_DEBUG=1 (check the modules' buffers against the arena and ring on every call; always checked once at load).
 """
 
@@ -68,6 +69,7 @@ import fcntl
 import json
 import mmap
 import os
+import struct
 import threading
 import time
 from collections import deque
@@ -116,6 +118,7 @@ def settings(env: Any = None) -> dict[str, Any] | None:
     out["mincore"] = _env_flag(env, "TF_EXPERT_MINCORE")
     out["pin"] = _env_flag(env, "TF_EXPERT_PIN")
     out["stats"] = str(env.get("TF_EXPERT_STATS", "")).strip() or None
+    out["trace"] = str(env.get("TF_EXPERT_TRACE", "")).strip() or None
     out["debug"] = _env_flag(env, "TF_EXPERT_DEBUG")
     out["ring"] = str(env.get("TF_EXPERT_RING", "split")).strip() or "split"
     if out["ring"] not in ("split", "shared"):
@@ -885,6 +888,59 @@ class SharedRing:
         return views
 
 
+# -- the router trace (TF_EXPERT_TRACE) -------------------------------------------
+class _Trace:
+    """Binary router trace, format ``rtrace1``: a JSON header line, then per streamed-layer call a fixed
+    head, the call's routed ids (rows x top_k, uint8, router order, row-major) and its miss ids (uint8, sorted). Records
+    are buffered and written at each forward's start and on close. The file is created exclusively, so an existing path
+    is refused. Host arrays only: no MLX call and no GPU sync."""
+
+    # t_ns, fwd, rows, layer, path, flags, top_k, uniq, misses, warmed, n_miss_ids, read_bytes, read_ms, wait_ms, sync_ms
+    HEAD = struct.Struct("<QIIBBBBHHHHIfff")
+
+    def __init__(self, path: str, header: dict[str, Any]) -> None:
+        data = json.dumps(header, sort_keys=True).encode() + b"\n"
+        self.path, self.buf = path, bytearray()
+        self.fd: int | None = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        self.buf += data
+        try:
+            self.flush()
+        except BaseException:
+            self.close()
+            raise
+
+    def add(self, t_ns: int, fwd: int, rows: int, layer: int, path: int, flags: int, top_k: int, uniq: int,
+            misses: int, warmed: int, read_bytes: int, read_ms: float, wait_ms: float, sync_ms: float,
+            ids: np.ndarray, miss_ids: np.ndarray) -> None:
+        if self.fd is None:
+            raise RuntimeError(f"trace {self.path} is closed")
+        if ids.size != rows * top_k:
+            raise ValueError(f"trace: {ids.size} routed ids for {rows} rows x {top_k}")
+        # uniq, misses and warmed are counts a layer bounds by E <= 256; n_miss_ids is the exact length written below
+        self.buf += self.HEAD.pack(t_ns, fwd, rows, layer, path, flags, top_k, min(uniq, 0xFFFF), min(misses, 0xFFFF),
+                                   min(warmed, 0xFFFF), int(miss_ids.size), min(read_bytes, 0xFFFFFFFF), read_ms,
+                                   wait_ms, sync_ms)
+        self.buf += ids.astype(np.uint8).tobytes()
+        self.buf += miss_ids.astype(np.uint8).tobytes()
+
+    def flush(self) -> None:
+        if self.fd is None or not self.buf:
+            return
+        data = memoryview(bytes(self.buf))
+        self.buf.clear()
+        while len(data):
+            data = data[os.write(self.fd, data):]
+
+    def close(self) -> None:
+        if self.fd is None:
+            return
+        try:
+            self.flush()
+        finally:
+            os.close(self.fd)
+            self.fd = None
+
+
 # -- the stream -------------------------------------------------------------------
 _TOTALS = ("misses", "bytes", "read_bytes", "reads", "read_ms", "wait_ms", "sync_ms", "settle_ms", "cold_reads",
            "cached_reads", "cold_bytes", "cached_bytes", "copied", "warmed")
@@ -956,6 +1012,14 @@ class ExpertStream:
         self._stats = open(cfg["stats"], "a") if cfg.get("stats") else None
         self._next: int | None = None
         self._owner: int | None = None
+        self.forwards = -1
+        self.trace: _Trace | None = None
+        try:
+            if cfg.get("trace"):
+                self.trace = _Trace(cfg["trace"], self._trace_header())
+        except BaseException:
+            self.close()  # releases the reader, the pin and the stats file taken above
+            raise
 
     @property
     def arena_bytes(self) -> int:
@@ -975,6 +1039,8 @@ class ExpertStream:
             extra += f", resident layers {self.resident} ({self.resident_bytes / 2**30:.2f} GiB)"
         if self.layer_slots:
             extra += ", layer slots " + " ".join(f"{k}:{v}" for k, v in sorted(self.layer_slots.items()))
+        if self.trace is not None:
+            extra += f", trace {self.trace.path}"
         return (f"tensorfold: expert stream: {self.slots} slots a layer ({self.arena_bytes / 2**30:.2f} GiB arena)"
                 f"{extra}, ring {self.ring.nbytes / 2**20:.0f} MiB {'shared' if self.ring.shared else 'split'}, io threads {self.reader.threads}, "
                 f"mincore {'on' if self.reader.mincore else 'off'}, "
@@ -993,12 +1059,29 @@ class ExpertStream:
 
         return sum(_check(model.layers[a.layer].mlp.switch_mlp, a.expect) for a in self.arenas)
 
+    def _trace_header(self) -> dict[str, Any]:
+        """The header line of TF_EXPERT_TRACE: the settings, and each streamed layer's experts, slots and bytes."""
+
+        wide = [a.E for a in self.arenas if a.E > 256]
+        if wide:
+            raise ValueError(f"TF_EXPERT_TRACE: the trace stores expert ids as u8; a layer has {max(wide)} experts")
+        return {"format": "rtrace1", "pid": os.getpid(), "unix_time": time.time(), "settings": dict(self.cfg),
+                "sort_min": SORT_MIN, "warm_rows": self.warm_rows, "prefill_rows": self.prefill_rows,
+                "ring": "shared" if self.ring.shared else "split",
+                "layers": [{"layer": int(a.layer), "E": int(a.E), "C": int(a.C),
+                            "resident": bool(a.fixed or a.layer in self.resident),
+                            "file_bytes": int(sum(p.file_bytes for p in a.plans.values())),
+                            "served_bytes": int(a.nbytes // a.C)} for a in self.arenas]}
+
     # -- per call
     def _enter(self, layer: int) -> None:
         me, pos = threading.get_ident(), self.index[layer]
         if pos == 0:
             self._owner = me
             self.flush()
+            self.forwards += 1
+            if self.trace is not None:
+                self.trace.flush()
         elif self._next != pos or self._owner != me:
             self._next = None
             raise RuntimeError(f"expert stream: layer {layer} called out of order or from another thread; one "
@@ -1045,6 +1128,8 @@ class ExpertStream:
         if self._stats is not None:
             self._stats.close()
             self._stats = None
+        if self.trace is not None:
+            self.trace.close()
         self.reader.close()
         if self.pin is not None:
             self.pin.release()
@@ -1159,6 +1244,7 @@ class LayerStream:
             raise RuntimeError(f"expert stream: batch {x.shape[0]}; one sequence at a time (no batched lanes)")
         s._enter(arena.layer)
         t0 = time.perf_counter()
+        t0_ns = time.perf_counter_ns()
         ids = np.array(experts).reshape(-1).astype(np.int64)            # the host sync (up to this layer's router)
         t1 = time.perf_counter()
         s.settle()                                                      # every earlier reader of arena and ring
@@ -1166,7 +1252,9 @@ class LayerStream:
         rows = int(np.prod(experts.shape[:-1]))
         rec: dict[str, Any] = {"layer": arena.layer, "rows": rows, "ids": int(ids.size)}
         uniq = np.unique(ids)
+        pre_miss = uniq[arena.slot_of[uniq] < 0] if s.trace is not None else None  # the misses, before any plan
         switch = moe.switch_mlp
+        warm = False
         if ids.size < SORT_MIN and uniq.size <= arena.C:
             slots, misses = arena.plan(ids)
             st = arena.fill(misses, s.reader)
@@ -1192,6 +1280,14 @@ class LayerStream:
         t3 = time.perf_counter()
         rec.update({k: v for k, v in (st or {}).items() if k != "labeled"})
         rec.update(sync_ms=(t1 - t0) * 1e3, settle_ms=(t2 - t1) * 1e3, wait_ms=(t3 - t0) * 1e3)
+        if s.trace is not None:
+            hit_info = st or {}
+            flags = int(warm) | int(bool(rec.get("compact"))) << 1 | int(s.ring.shared) << 2 | int(rows == 1) << 3
+            s.trace.add(t_ns=t0_ns, fwd=s.forwards, rows=rows, layer=arena.layer,
+                        path=0 if rec["path"] == "arena" else 1, flags=flags, top_k=int(experts.shape[-1]),
+                        uniq=int(uniq.size), misses=int(rec["misses"]), warmed=int(rec.get("warmed", 0)),
+                        read_bytes=int(hit_info.get("read_bytes", 0)), read_ms=float(hit_info.get("read_ms", 0.0)),
+                        wait_ms=rec["wait_ms"], sync_ms=rec["sync_ms"], ids=ids, miss_ids=pre_miss)
         s.record(rec)
         return y
 
