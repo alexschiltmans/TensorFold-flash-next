@@ -595,3 +595,178 @@ def test_scheduler_runs_its_stop_hook_in_its_own_thread() -> None:
     scheduler.start()
     scheduler.stop(timeout=5.0)
     assert seen == ["tensorfold-engine"]
+
+
+class _PagedFake:
+    """A cache layer whose entry holds pages of the pool (``page_refs``), named for the assertions."""
+
+    def __init__(self, name: str = "") -> None:
+        self.name = name
+
+    def page_refs(self) -> list[tuple[int, int]]:
+        return [(0, 1)]
+
+
+def _grow_store(store: CheckpointStore) -> None:
+    """The grow sequence as the server stores it: a token probe, then turn 1 with a tail (100 tokens), a history
+    boundary (150) and a reply end (160); turns 2-4 each hit the previous reply end and store a history boundary and
+    a reply end 10 and 20 tokens further on."""
+
+    store.insert([9] * 5, ["probe"], last_prompt=[9] * 5)
+    store.insert(list(range(100)), ["tail"], last_prompt=list(range(101)), tail=True)
+    store.insert(list(range(150)), ["hb1"], last_prompt=list(range(161)))
+    store.insert(list(range(160)), ["re1"], last_prompt=list(range(161)))
+    reply_end = 160
+    for turn in range(2, 5):
+        prompt = list(range(reply_end)) + [900 + turn]
+        assert store.match(prompt)[0] == reply_end
+        store.insert(list(range(reply_end + 10)), [f"hb{turn}"], last_prompt=prompt)
+        store.insert(list(range(reply_end + 20)), [f"re{turn}"], last_prompt=prompt)
+        reply_end += 20
+
+
+def test_checkpoint_store_keeps_the_newest_conversations_tail_under_the_slot_cap() -> None:
+    store = CheckpointStore(8, copier=lambda c: c)
+    _grow_store(store)
+    # turn 4 takes the store to 9: the probe, then hb1 go, and the tail (the only stored prefix of a long request) stays
+    assert [e.cache[0] for e in store._entries] == ["re4", "hb4", "re3", "hb3", "re2", "hb2", "re1", "tail"]
+    assert store.evictions == 2
+    hit = store.match(list(range(100)) + [777, 778])
+    assert hit is not None and hit[0] == 100
+
+
+def test_checkpoint_store_evicts_the_tail_in_lru_order_when_keep_tail_is_off() -> None:
+    store = CheckpointStore(8, copier=lambda c: c, keep_tail=False)
+    _grow_store(store)
+    assert [e.cache[0] for e in store._entries] == ["re4", "hb4", "re3", "hb3", "re2", "hb2", "re1", "hb1"]
+    assert store.evictions == 2
+    assert store.match(list(range(100)) + [777]) is None      # today's order: the tail goes at turn 4
+
+
+def test_checkpoint_store_keeps_the_newest_conversations_tail_under_the_budget() -> None:
+    sizes = {"tail": 300, "A": 100, "B": 100, "C": 100, "E": 100, "D": 400}
+
+    def run(keep_tail: bool) -> list[str]:
+        store = CheckpointStore(100, copier=lambda c: c, budget_bytes=1000, sizer=lambda c: sizes[c[0]],
+                                keep_tail=keep_tail)
+        store.insert(list(range(100)), ["tail"], last_prompt=[1], tail=True)
+        for name, tokens in (("A", [5, 5]), ("B", [6, 6]), ("C", [7, 7]), ("E", [8, 8])):
+            store.insert(tokens, [name], last_prompt=tokens)
+        assert store.nbytes == 700
+        store.insert(list(range(100)) + [1000], ["D"], last_prompt=[1])      # the sixth insert: 1100 > 1000
+        assert store.evictions == 1
+        return [e.cache[0] for e in store._entries]
+
+    assert run(True) == ["D", "E", "C", "B", "tail"]          # the older non-tail (A) goes
+    assert run(False) == ["D", "E", "C", "B", "A"]            # today's order: the tail goes
+
+
+def test_checkpoint_store_evicts_the_tail_only_while_other_candidates_exist() -> None:
+    store = CheckpointStore(1, copier=lambda c: c)
+    store.insert(list(range(100)), ["tail"], last_prompt=[1], tail=True)
+    store.insert(list(range(101)), ["longer"], last_prompt=[1])    # over the slot cap: the tail is the only candidate
+    assert [e.cache[0] for e in store._entries] == ["longer"] and store.evictions == 1
+
+    sizes = {"block": 500, "tail": 300, "longer": 400}
+    store = CheckpointStore(10, copier=lambda c: c, budget_bytes=1000, sizer=lambda c: sizes[c[0]])
+    store.insert([1, 2, 3], ["block"], last_prompt=[1], pinned=True)
+    store.insert(list(range(100)), ["tail"], last_prompt=[1], tail=True)
+    store.insert(list(range(100)) + [1000], ["longer"], last_prompt=[1])   # 1200 > 1000: the tail goes before the block
+    assert [e.cache[0] for e in store._entries] == ["longer", "block"] and store.evictions == 1
+
+
+def test_checkpoint_store_follows_the_most_recent_conversation() -> None:
+    store = CheckpointStore(2, copier=lambda c: c)
+
+    def names() -> list[str]:
+        return [e.cache[0] for e in store._entries]
+
+    store.insert(list(range(100)), ["tailA"], last_prompt=[1], tail=True)
+    store.insert(list(range(160)), ["replyA"], last_prompt=[1])
+    store.insert(list(range(170)), ["replyA2"], last_prompt=[1])      # conversation A in use: its tail is kept
+    assert names() == ["replyA2", "tailA"]
+    store.insert(list(range(500, 600)), ["tailB"], last_prompt=[1], tail=True)   # B starts: A's tail is not kept
+    assert names() == ["tailB", "replyA2"]
+    store.insert([7, 7], ["title"], last_prompt=[7, 7])               # a new topic: no tail is kept
+    assert names() == ["title", "tailB"]
+    store.insert(list(range(500, 600)) + [1], ["replyB"], last_prompt=[1])   # B in use again: its tail is kept
+    assert names() == ["replyB", "tailB"]
+
+
+def test_checkpoint_store_protects_only_the_newest_of_two_tails() -> None:
+    store = CheckpointStore(3, copier=lambda c: c)
+    store.insert(list(range(200)), ["tail2"], last_prompt=[1], tail=True)     # the longer tail is the least recent
+    store.insert(list(range(100)), ["tail1"], last_prompt=[1], tail=True)     # a prefix of it, used more recently
+    store.insert(list(range(220)), ["reply"], last_prompt=[1])
+    assert [e.cache[0] for e in store._entries] == ["reply", "tail1", "tail2"]
+    store.insert(list(range(240)), ["reply2"], last_prompt=[1])   # 4 > 3: both tails are prefixes, the longer is kept
+    assert [e.cache[0] for e in store._entries] == ["reply2", "reply", "tail2"] and store.evictions == 1
+
+
+def test_checkpoint_store_evicts_an_ordinary_entry_then_an_anchor_before_the_kept_tail(
+        capsys: pytest.CaptureFixture[str]) -> None:
+    sizes = {"tail": 300, "anchor": 300, "ordinary": 300, "head": 500}
+    store = CheckpointStore(10, copier=lambda c: c, budget_bytes=1000, sizer=lambda c: sizes[c[0]])
+    store.insert(list(range(100)), ["tail"], last_prompt=[1], tail=True)
+    store.insert([50] * 20, ["anchor"], last_prompt=[1], anchor=True)
+    store.insert([60] * 20, ["ordinary"], last_prompt=[1])
+    assert store.nbytes == 900
+    store.insert(list(range(100)) + [1000], ["head"], last_prompt=[1])      # 1400 > 1000: two victims
+    assert [e.cache[0] for e in store._entries] == ["head", "tail"] and store.evictions == 2
+    kinds = [line.split("kind=")[1].split()[0] for line in capsys.readouterr().out.splitlines()
+             if "evicted" in line]
+    assert kinds == ["entry", "anchor"]
+
+
+def test_evict_lru_drops_the_newest_conversations_tail_last() -> None:
+    from tensorfold.server.app import CheckpointEntry
+
+    def build(keep_tail: bool) -> CheckpointStore:
+        store = CheckpointStore(8, copier=lambda c: c, keep_tail=keep_tail)
+        store._entries = [                                  # most recently used first
+            CheckpointEntry(list(range(30)), [_PagedFake("re")], list(range(31))),
+            CheckpointEntry([5] * 20, [_PagedFake("x")], [0]),
+            CheckpointEntry(list(range(20)), [_PagedFake("anchor")], [0], anchor=True),
+            CheckpointEntry(list(range(10)), [_PagedFake("tail")], [0], tail=True),
+        ]
+        return store
+
+    def drops(store: CheckpointStore) -> list[list[str]]:
+        remaining = []
+        while store.evict_lru():
+            remaining.append([e.cache[0].name for e in store._entries])
+        return remaining
+
+    # the tail is a prefix of the head (the anchor, then the reply), so it goes after the others
+    assert drops(build(True)) == [["re", "anchor", "tail"], ["anchor", "tail"], ["tail"], []]
+    assert drops(build(False)) == [["re", "x", "anchor"], ["re", "anchor"], ["anchor"], []]
+
+
+def test_prompt_cache_logs_each_eviction(capsys: pytest.CaptureFixture[str]) -> None:
+    from tensorfold.server.app import CheckpointEntry
+
+    store = CheckpointStore(1, copier=lambda c: c)
+    store.insert(list(range(100)), ["tail"], last_prompt=[1], tail=True)
+    store.insert(list(range(101)), ["longer"], last_prompt=[1])
+    assert "evicted a 100-token entry (reason=slots kind=tail newest_tail=yes" in capsys.readouterr().out
+
+    sizes = {"block": 100, "tail": 300, "longer": 700}
+    store = CheckpointStore(10, copier=lambda c: c, budget_bytes=1000, sizer=lambda c: sizes[c[0]])
+    store.insert([1, 2, 3], ["block"], last_prompt=[1], pinned=True)
+    store.insert(list(range(100)), ["tail"], last_prompt=[1], tail=True)
+    store.insert(list(range(101)), ["longer"], last_prompt=[1])            # 1100 > 1000, two entries left
+    out = capsys.readouterr().out
+    assert "(reason=budget kind=tail newest_tail=yes" in out and "freed=0.00 GiB left=2 entries)" in out
+
+    store = CheckpointStore(8, copier=lambda c: c)
+    store._entries = [CheckpointEntry(list(range(30)), [_PagedFake()], list(range(31))),
+                      CheckpointEntry(list(range(20)), [_PagedFake()], [0])]
+    assert store.evict_lru()
+    assert "evicted a 20-token entry for KV pages (reason=pages" in capsys.readouterr().out
+
+
+def test_checkpoint_store_keeps_the_tail_flag_when_the_same_tokens_come_again() -> None:
+    store = CheckpointStore(8, copier=lambda c: c)
+    store.insert(list(range(100)), ["tail"], last_prompt=[1], tail=True)
+    store.insert(list(range(100)), ["tail-again"], last_prompt=[1, 2])
+    assert len(store) == 1 and store._entries[0].tail

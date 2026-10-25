@@ -23,7 +23,8 @@ based on upstream commit
   block, in a new Metal kernel (`TF_FLASH_SPARSE_PREFILL`).
 - Extra prompt-cache checkpoints where a prompt diverges from an earlier one and near the end of long prompts, with
   nested entries sharing KV (`TF_PREFIX_ANCHORS`, `TF_PREFIX_SHARE`); the checkpoints one prefill takes share one KV
-  copy (`TF_CKPT_SHARE`, with `TF_CACHE_COMPACT`).
+  copy (`TF_CKPT_SHARE`, with `TF_CACHE_COMPACT`), and the newest conversation's near-end checkpoint is evicted last
+  (`TF_PREFIX_KEEP_TAIL`, on by default).
 - Prompt-cache entries and prefill checkpoints that share their sparse-attention KV in pages, while the request being
   served keeps contiguous buffers (`TF_KV_PAGED`, `TF_KV_POOL_PAGES`; [kv-pages.md](kv-pages.md)).
 - Routed experts streamed from the expert GGUF into a fixed number of slots per layer, read with `F_NOCACHE` into

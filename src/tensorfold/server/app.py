@@ -383,6 +383,9 @@ class CheckpointEntry:
     pinned: bool = False
     # A divergence anchor (TF_PREFIX_ANCHORS): evicted after the other conversation entries.
     anchor: bool = False
+    # A tail checkpoint (TF_PREFIX_ANCHORS: TAIL_BACKOFF before a long prompt's end): the newest one of the
+    # conversation used last is evicted after the other unpinned entries (TF_PREFIX_KEEP_TAIL)
+    tail: bool = False
 
 
 def save_conversations(store: "CheckpointStore", directory: Path, model_id: str, *, keep: int = 2,
@@ -421,6 +424,38 @@ def save_conversations(store: "CheckpointStore", directory: Path, model_id: str,
     return saved
 
 
+def newest_tail(entries: list[CheckpointEntry]) -> CheckpointEntry | None:
+    """The tail checkpoint of the conversation used last (TF_PREFIX_KEEP_TAIL), or None. Its next request may re-ask or
+    edit the last message, and then its tail is the only stored prefix it can hit (a 188K prompt prefilled cold for
+    871 s). Only the longest such tail is protected: the newest one."""
+
+    head = next((entry for entry in entries if not entry.pinned), None)
+    if head is None:
+        return None
+    best: CheckpointEntry | None = None
+    for entry in entries:
+        if (entry.tail and not entry.pinned and len(entry.tokens) <= len(head.tokens)
+                and head.tokens[: len(entry.tokens)] == entry.tokens):
+            if best is None or len(entry.tokens) > len(best.tokens):
+                best = entry
+    return best
+
+
+def _entry_kind(entry: CheckpointEntry) -> str:
+    return "tail" if entry.tail else "anchor" if entry.anchor else "pinned" if entry.pinned else "entry"
+
+
+def _evicted_line(tokens: int, reason: str, kind: str, newest: bool, nbytes: int, left: int,
+                  freed: int | None = None, pages: bool = False) -> str:
+    """The log line for one eviction; ``freed`` is the drop in the store's bytes, when it was computed."""
+
+    where = " for KV pages" if pages else ""
+    freed_part = "" if freed is None else f" freed={freed / 1024**3:.2f} GiB"
+    return (f"[tensorfold] prompt cache: evicted a {tokens}-token entry{where} (reason={reason} kind={kind} "
+            f"newest_tail={'yes' if newest else 'no'} entry={nbytes / 1024**3:.2f} GiB{freed_part} "
+            f"left={left} entries)")
+
+
 class CheckpointStore:
     """LRU of absorbed conversation prefixes with their single-row caches.
 
@@ -450,6 +485,7 @@ class CheckpointStore:
         sizer: Callable[[list[Any]], int] | None = None,
         pinned_slots: int = 3,
         share_prefixes: bool = False,
+        keep_tail: bool = True,
     ) -> None:
         if slots < 1:
             raise ValueError("slots must be positive")
@@ -463,6 +499,8 @@ class CheckpointStore:
         # TF_PREFIX_SHARE: a stored prefix of another entry holds that entry's KV arrays (``share_prefix_kv``), and
         # the budget counts distinct arrays
         self.share_prefixes = bool(share_prefixes)
+        # TF_PREFIX_KEEP_TAIL: the newest conversation's tail checkpoint is evicted after the other entries
+        self.keep_tail = bool(keep_tail)
         self._entries: list[CheckpointEntry] = []
         # reentrant, so evict_lru (which a full page pool calls) is safe in code that already holds it
         self._lock = threading.RLock()
@@ -512,7 +550,7 @@ class CheckpointStore:
                        default=0)
 
     def insert(self, tokens: list[int], cache: list[Any], *, last_prompt: list[int],
-               pinned: bool = False, anchor: bool = False) -> None:
+               pinned: bool = False, anchor: bool = False, tail: bool = False) -> None:
         if not tokens:
             return
         # a layer cache with ``store_copy()`` is stored in that form: with TF_KV_PAGED a finished request's contiguous
@@ -530,7 +568,8 @@ class CheckpointStore:
             kept = [entry for entry in self._entries if entry.tokens != list(tokens)]
             pinned = pinned or any(entry.pinned for entry in replaced)
             anchor = anchor or any(entry.anchor for entry in replaced)
-            entry = CheckpointEntry(list(tokens), cache, list(last_prompt), nbytes, pinned, anchor)
+            tail = tail or any(entry.tail for entry in replaced)
+            entry = CheckpointEntry(list(tokens), cache, list(last_prompt), nbytes, pinned, anchor, tail=tail)
             if self.share_prefixes:
                 # stored prefixes of the new entry (at least half its length: a short system block must not keep a
                 # long conversation's arrays alive) take its KV arrays; stored entries it is a prefix of lend theirs
@@ -547,30 +586,60 @@ class CheckpointStore:
             for extra in [e for e in entries if e.anchor][ANCHOR_SLOTS:]:
                 extra.anchor = False
             # the new entry itself is never evicted: least recently used first, conversations
-            # before divergence anchors before system blocks
+            # before divergence anchors before the newest conversation's tail before system blocks
+            newest_known = False
+            newest: CheckpointEntry | None = None
+            keep: CheckpointEntry | None = None
+            events: list[dict[str, Any]] = []     # one per eviction; "freed" is filled in by the next pass
+            before: int | None = None             # the store's bytes before the last drop
             while True:
                 over_slots = sum(1 for e in entries if not e.pinned) > self.slots
-                over_budget = (self.budget_bytes is not None and len(entries) > 1
-                               and self._bytes(entries) > self.budget_bytes)
+                total = self._bytes(entries) if self.budget_bytes is not None and len(entries) > 1 else None
+                if events and events[-1]["freed"] is None and total is not None and before is not None:
+                    events[-1]["freed"] = before - total
+                over_budget = total is not None and total > self.budget_bytes
                 if not (over_slots or over_budget):
                     break
-                unpinned = ([i for i in range(1, len(entries)) if not entries[i].pinned and not entries[i].anchor]
-                            or [i for i in range(1, len(entries)) if not entries[i].pinned])
-                if unpinned:
-                    entries.pop(unpinned[-1])
+                if not newest_known:
+                    newest = newest_tail(entries)
+                    keep = newest if self.keep_tail else None
+                    newest_known = True
+                candidates = (
+                    [i for i in range(1, len(entries))
+                     if not entries[i].pinned and not entries[i].anchor and entries[i] is not keep]
+                    or [i for i in range(1, len(entries)) if not entries[i].pinned and entries[i] is not keep]
+                    or [i for i in range(1, len(entries)) if not entries[i].pinned]
+                )
+                if candidates:
+                    dropped = entries.pop(candidates[-1])
                 elif over_budget:
-                    entries.pop()
+                    dropped = entries.pop()
                 else:
                     break
                 self.evictions += 1
+                reason = "slots+budget" if over_slots and over_budget else "slots" if over_slots else "budget"
+                events.append({
+                    "tokens": len(dropped.tokens), "reason": reason, "kind": _entry_kind(dropped),
+                    "newest": dropped is newest, "nbytes": dropped.nbytes, "left": len(entries), "freed": None,
+                })
+                # a dropped newest or kept entry is no longer in the store: let go of it now, so its pages return now
+                if dropped is newest:
+                    newest = None
+                if dropped is keep:
+                    keep = None
+                del dropped
+                before = total
             self._entries = entries
+            lines = [_evicted_line(**event) for event in events]
+        for line in lines:
+            print(line, flush=True)
 
     def evict_lru(self) -> bool:
-        """Drop the least recently used entry that holds pages, conversations before divergence anchors, for a model
-        whose entries hold pages of a pool with no free page left (``attach_prompt_cache``). The entry last used goes
-        too when nothing else is left; pinned system blocks never do, and entries without pages (contiguous copies)
-        stay, since dropping them frees no page (the copy that needs the page is made contiguous instead). False when
-        no unpinned entry holds pages."""
+        """Drop the least recently used entry that holds pages, conversations before divergence anchors before the
+        newest conversation's tail, for a model whose entries hold pages of a pool with no free page left
+        (``attach_prompt_cache``). The entry last used goes too when nothing else is left; pinned system blocks never
+        do, and entries without pages (contiguous copies) stay, since dropping them frees no page (the copy that needs
+        the page is made contiguous instead). False when no unpinned entry holds pages."""
 
         import gc
 
@@ -580,17 +649,22 @@ class CheckpointStore:
         with self._lock:
             entries = self._entries
             paged = [i for i, e in enumerate(entries) if not e.pinned and holds_pages(e)]
-            order = [i for i in paged if not entries[i].anchor] or paged
-            if not order:
+            if not paged:
                 return False
+            newest = newest_tail(entries)
+            keep = newest if self.keep_tail else None
+            order = ([i for i in paged if not entries[i].anchor and entries[i] is not keep]
+                     or [i for i in paged if entries[i] is not keep] or paged)
             dropped = entries.pop(order[-1])
             self.evictions += 1
-        tokens = len(dropped.tokens)
+            tokens, kind, nbytes = len(dropped.tokens), _entry_kind(dropped), dropped.nbytes
+            is_newest, left = dropped is newest, len(entries)
+            newest = keep = None      # a local reference here would keep the dropped entry's pages alive
         # the layers give their pages back in __del__ (CPython frees the entry when this last reference goes);
         # collect in case a reference cycle holds it
         del dropped
         gc.collect()
-        print(f"[tensorfold] prompt cache: evicted a {tokens}-token entry for KV pages", flush=True)
+        print(_evicted_line(tokens, "pages", kind, is_newest, nbytes, left, pages=True), flush=True)
         return True
 
     def __len__(self) -> int:
@@ -942,11 +1016,15 @@ class Scheduler:
                 for tokens, snapshot in stream.history_checkpoints:
                     shared = len(tokens) in job.shared_prefix_lens
                     anchored = bool(anchor_at) and len(tokens) == anchor_at and not shared
+                    tailed = bool(tail_at) and len(tokens) == tail_at and not shared
                     self.checkpoints.insert(tokens, snapshot, last_prompt=job.prompt_ids, pinned=shared,
-                                            anchor=anchored)
+                                            anchor=anchored, tail=tailed)
                     if anchored:
                         print(f"[tensorfold] anchor checkpoint tokens={len(tokens)} (prompt={len(job.prompt_ids)} "
                               f"cached={cached}: shares this prefix with an earlier prompt)", flush=True)
+                    if tailed:
+                        print(f"[tensorfold] tail checkpoint tokens={len(tokens)} (prompt={len(job.prompt_ids)} "
+                              f"cached={cached})", flush=True)
                     if self.snapshot_dir is not None and shared:
                         self._persist(tokens, snapshot)
             stream.history_checkpoints = []
@@ -1094,10 +1172,11 @@ class ChatApp:
         # TF_PREFIX_SHARE=1 lets nested entries share KV arrays (model families with their own caches only)
         anchors = _env_flag("TF_PREFIX_ANCHORS")
         share = _env_flag("TF_PREFIX_SHARE") and bool(getattr(model, "lane_family", False))
+        keep_tail = _env_flag("TF_PREFIX_KEEP_TAIL", True)
         self.checkpoints = (
             CheckpointStore(int(checkpoint_slots), copier=self.engine.copy_single_cache,
                             budget_bytes=checkpoint_budget_bytes, sizer=self.engine.cache_nbytes,
-                            pinned_slots=max(3, self.max_snapshots), share_prefixes=share)
+                            pinned_slots=max(3, self.max_snapshots), share_prefixes=share, keep_tail=keep_tail)
             if int(checkpoint_slots) > 0 else None
         )
         # a model whose prompt-cache entries hold pages of a fixed pool (Flash Next with TF_KV_PAGED=1) sizes the
@@ -1130,6 +1209,10 @@ class ChatApp:
             compact = os.environ.get("TF_CACHE_COMPACT", "").strip() not in ("", "0")
             print(f"[tensorfold] prompt cache: divergence anchors {'on' if anchors else 'off'}, "
                   f"shared prefix KV {'on' if share else 'off'}{', compact copies on' if compact else ''}", flush=True)
+        if anchors:
+            order = "last" if keep_tail else "in LRU order"
+            print(f"[tensorfold] prompt cache: newest tail checkpoint evicted {order} "
+                  f"(TF_PREFIX_KEEP_TAIL={int(keep_tail)})", flush=True)
         loaded_count = 0
         if snapshot_dir is not None and self.checkpoints is not None:
             from tensorfold.engine.prefix_snapshots import load_snapshots
