@@ -276,12 +276,26 @@ class ToolCallStreamer:
     only the template's one framing newline a side is dropped, so the client's
     resent history is the tokens the model wrote), so a client can show a file
     being written instead of a silent minute.
+
+    A parameter whose schema type is not a string (opencode's ``offset``, ``timeout``,
+    ``todos``) is held until it closes and then emitted as the end parser's coerced value.
+    Sent as a string, ``"20"`` failed the client's integer check and the model spent a turn
+    retrying.
     """
 
     _TAIL = "</parameter>"
 
     def __init__(self, tools: Sequence[dict[str, Any]] | None) -> None:
         self.known = {name.lower(): name for name in tool_schema(tools)}
+        self.props: dict[str, dict[str, Any]] = {}
+        for tool in tools or []:
+            spec: dict[str, Any] = tool["function"] if isinstance(tool.get("function"), dict) else tool
+            params: dict[str, Any] = spec.get("parameters") or spec.get("input_schema") or {}
+            props = params.get("properties")
+            self.props[str(spec.get("name") or "").lower()] = props if isinstance(props, dict) else {}
+        self.function = ""      # the open call's tool name, lower case
+        self.prop: Any = None   # the open parameter's schema while it is held for coercion
+        self.typed = ""         # the held value's text so far
         self.pos = 0
         self.state = "outside"
         self.index = -1
@@ -322,6 +336,7 @@ class ToolCallStreamer:
                     self.state = "abort"
                     break
                 self.index += 1
+                self.function = m.group(1).strip().lower()
                 self.streamed = True
                 out.append({"tool_calls": [{"index": self.index, "id": f"call_{uuid.uuid4().hex[:24]}",
                                             "type": "function",
@@ -332,8 +347,15 @@ class ToolCallStreamer:
             elif self.state == "function":
                 m = re.match(r"\s*<parameter=([^>\n]+)>\n?", rest)
                 if m is not None:
-                    out.append(self._args(("," if self.args_open else "{")
-                                          + self._esc_key(m.group(1).strip()) + ':"'))
+                    from tensorfold.server.http import _schema_types
+
+                    key = m.group(1).strip()
+                    prop = self.props.get(self.function, {}).get(key)
+                    types = _schema_types(prop)
+                    self.prop = prop if types and "string" not in types else None
+                    self.typed = ""
+                    out.append(self._args(("," if self.args_open else "{") + self._esc_key(key)
+                                          + (":" if self.prop is not None else ':"')))
                     self.args_open = True
                     self.pos += m.end()
                     self.state = "value"
@@ -361,11 +383,22 @@ class ToolCallStreamer:
                 else:
                     keep = piece.rstrip()   # its last newline may be the framing one
                     self.held = piece[len(keep):]
-                if keep:
+                if keep and self.prop is not None:
+                    self.typed += keep
+                elif keep:
                     out.append(self._args(self._esc(keep)))
                 if end < 0:
                     break
-                out.append(self._args('"'))
+                if self.prop is not None:
+                    import json
+
+                    from tensorfold.server.http import _coerce_value
+
+                    out.append(self._args(json.dumps(_coerce_value(self.typed, self.prop), ensure_ascii=False,
+                                                     separators=(",", ":"))))
+                    self.prop = None
+                else:
+                    out.append(self._args('"'))
                 self.pos += len(self._TAIL)
                 self.state = "function"
             elif self.state == "closing":

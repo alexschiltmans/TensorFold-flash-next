@@ -192,3 +192,48 @@ def test_target_candidates_reach_the_capture_sidecar(tmp_path):
     positions = np.frombuffer(data, np.int64, count, 8)
     ids = np.frombuffer(data, np.int32, count * k, 8 + 8 * count).reshape(count, k)
     assert list(positions) == [11, 12] and (ids[1] == keep["cand"][1]).all()
+
+
+def test_typed_parameters_stream_as_the_parsed_values():
+    """opencode's schemas: integer offset/limit/timeout and an array of todos. Streamed as strings, they
+    failed the client's schema check (SchemaError: Expected number, got "20") and the model retried the turn."""
+    import json
+
+    from tensorfold.server.http import parse_tool_calls_from_content
+    from tensorfold.engine.tool_draft import ToolCallStreamer
+
+    integer = {"minimum": 0, "type": "integer", "maximum": 9007199254740991}
+    tools = [
+        {"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {
+            "filePath": {"type": "string"}, "offset": integer, "limit": integer}, "required": ["filePath"]}}},
+        {"type": "function", "function": {"name": "bash", "parameters": {"type": "object", "properties": {
+            "command": {"type": "string"}, "timeout": {"type": "integer"}}, "required": ["command"]}}},
+        {"type": "function", "function": {"name": "todowrite", "parameters": {"type": "object", "properties": {
+            "todos": {"type": "array", "items": {"type": "object"}}}}}},
+        {"type": "function", "function": {"name": "edit", "parameters": {"type": "object", "properties": {
+            "filePath": {"type": "string"}, "replaceAll": {"type": "boolean"}}}}},
+    ]
+    todos = '[{"content": "a \\"b\\"", "status": "pending", "priority": "high"}]'
+    cases = [
+        ("read", {"filePath": "tasks.md", "offset": "118", "limit": "10"},
+         {"filePath": "tasks.md", "offset": 118, "limit": 10}),
+        ("bash", {"command": "make check 2>&1 | tail -15", "timeout": "600000"},
+         {"command": "make check 2>&1 | tail -15", "timeout": 600000}),
+        ("todowrite", {"todos": todos}, {"todos": json.loads(todos)}),
+        ("edit", {"filePath": "x.py", "replaceAll": "true"}, {"filePath": "x.py", "replaceAll": True}),
+        ("read", {"filePath": "x", "offset": "twenty"}, {"filePath": "x", "offset": "twenty"}),
+        ("read", {"filePath": "007", "offset": "7"}, {"filePath": "007", "offset": 7}),
+    ]
+    for name, written, expected in cases:
+        body = "".join(f"<parameter={k}>\n{v}\n</parameter>\n" for k, v in written.items())
+        full = f"Doing it.\n<tool_call>\n<function={name}>\n{body}</function>\n</tool_call>"
+        _, calls = parse_tool_calls_from_content(full, tools)
+        assert json.loads(calls[0]["function"]["arguments"]) == expected
+        for step in (1, 4, 9):
+            streamer = ToolCallStreamer(tools)
+            deltas = []
+            for n in range(1, len(full) + 1, step):
+                deltas += streamer.feed(full[:n])
+            deltas += streamer.feed(full)
+            arguments = "".join(d["tool_calls"][0]["function"].get("arguments", "") for d in deltas)
+            assert json.loads(arguments) == expected, (name, step, arguments)
